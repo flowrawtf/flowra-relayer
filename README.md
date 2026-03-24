@@ -1,33 +1,87 @@
-# Jito Relayer
-Jito Relayer acts as a transaction processing unit (TPU) proxy for Solana validators.
+# flowra-relayer
 
-# Building
-```shell
-# pull submodules to get protobuffers required to connect to Block Engine and validator
-$ git submodule update -i -r
-# build from source
-$ cargo b --release
+**Flowra Relayer** — a fork of [jito-relayer](https://github.com/jito-foundation/jito-relayer) configured for the Flowra MEV stack.
+
+## Changes from upstream
+
+| Change | Detail |
+|--------|--------|
+| `--packet-delay-ms` default | Changed `50ms → 0ms` (Flowra target: zero delay) |
+| Proto extensions | `block_engine.proto` extended with `ProgramsOfInterestRequest/Update` and `SubscribeProgramsOfInterest` RPC |
+| `AccountsOfInterestUpdate` | Changed from `oneof msg` to flat `repeated string accounts` field to match jito-relayer's actual usage |
+
+## What the relayer does
+
+The relayer sits between the validator's TPU and the block engine:
+
+```
+Validators/Users ──QUIC──▶ flowra-relayer ──gRPC──▶ flowra-engine
+                                │                         │
+                         (ExpiringPacketStream)    (mempool broadcast)
+                                                         ▼
+                                                     Searchers
 ```
 
-# Releases
+1. Receives transactions via QUIC TPU
+2. Authenticates with flowra-engine (`Role::Relayer`)
+3. Subscribes to Accounts of Interest + Programs of Interest from the engine
+4. Filters and forwards matching transactions to the engine via `StartExpiringPacketStream`
+5. Heartbeats maintain the bidirectional stream
 
-## Making a release
+## Build
 
-We opt to use cargo workspaces for making releases.
-First, install cargo workspaces by running: `cargo install cargo-workspaces`.
-Next, check out the master branch of the jito-relayer repo and 
-ensure you're on the latest commit.
-In the master branch, run the following command and follow the instructions:
-```shell
-$ ./release
+```bash
+source ~/.cargo/env
+cargo build --release --bin jito-transaction-relayer
 ```
-This will bump all the versions of the packages in your repo, 
-push to master and tag a new commit.
 
-## Running a release
-There are two options for running the relayer from releases:
-- Download the most recent release on the [releases](https://github.com/jito-foundation/jito-relayer/releases) page.
-- (Not recommended for production): One can download and run Docker containers from the Docker [registry](https://hub.docker.com/r/jitolabs/jito-transaction-relayer).
+## Run
 
-# Running a Relayer
-See https://jito-foundation.gitbook.io/mev/jito-relayer/running-a-relayer for setup and usage instructions.
+```bash
+./target/release/jito-transaction-relayer \
+  --keypair-path               /path/to/relayer-identity.json \
+  --signing-key-pem-path       /path/to/relayer-signing.pem \
+  --verifying-key-pem-path     /path/to/relayer-verifying.pem \
+  --rpc-servers                http://127.0.0.1:8899 \
+  --block-engine-url           http://127.0.0.1:11228 \
+  --block-engine-auth-service-url http://127.0.0.1:8003 \
+  --packet-delay-ms            0 \
+  --grpc-bind-ip               0.0.0.0 \
+  --grpc-bind-port             11230
+```
+
+### Key flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--block-engine-url` | — | flowra-engine relayer port (11228) |
+| `--block-engine-auth-service-url` | same as above | flowra-engine auth port (8003) |
+| `--packet-delay-ms` | `0` | Packet forwarding delay (upstream default was 50ms) |
+| `--keypair-path` | — | Relayer identity keypair (used for auth challenge signing) |
+
+### Generating keys
+
+```bash
+# Relayer identity keypair
+solana-keygen new -o relayer-identity.json
+
+# RSA signing keys for JWT (relayer's own auth service for validators)
+openssl genrsa -out relayer-signing.pem 2048
+openssl rsa -in relayer-signing.pem -pubout -out relayer-verifying.pem
+```
+
+## Connection flow
+
+1. Relayer connects to `--block-engine-auth-service-url` and authenticates with `Role::Relayer`
+2. Connects to `--block-engine-url` and calls `SubscribeAccountsOfInterest` + `SubscribeProgramsOfInterest`
+3. Engine returns wildcard `["*"]` — relayer forwards all packets
+4. Opens `StartExpiringPacketStream` bidirectional stream
+5. All incoming QUIC packets are forwarded to the engine after filtering
+6. Engine distributes packets to subscribed searchers via `SubscribePendingTransactions`
+
+## Monitoring
+
+Key metrics in logs:
+- `block_engine_relayer-loop_stats`: `heartbeat_count`, `num_packets_received`, `packet_forward_count`
+- `forwarder_metrics`: `num_be_packets_forwarded`, `num_be_packets_dropped`
+- `relayer_metrics`: `num_current_connections`, `num_heartbeats`
