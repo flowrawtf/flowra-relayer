@@ -129,8 +129,10 @@ struct Args {
     #[arg(long, env)]
     public_ip: Option<IpAddr>,
 
-    /// Packet delay in milliseconds
-    #[arg(long, env, default_value_t = 0)]
+    /// Packet delay in milliseconds (Jito default 50ms: holds packets briefly so
+    /// the block engine/searchers can build & land bundles before the standalone
+    /// tx reaches the validator — see tx-journey T0+/T8 dedup race).
+    #[arg(long, env, default_value_t = 50)]
     packet_delay_ms: u32,
 
     /// Address for Jito Block Engine.
