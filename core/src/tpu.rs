@@ -90,6 +90,10 @@ impl Tpu {
                         max_connections_per_ipaddr_per_min: MAX_CONNECTIONS_PER_IPADDR_PER_MIN,
                         max_staked_connections,
                         max_unstaked_connections,
+                        // Dedicated relayer box: lift per-interval stream budget well above the
+                        // validator self-protective default (250) so legit staked TPU flow isn't
+                        // throttled during leader windows. 1000/ms = 100k units / 100ms interval.
+                        max_streams_per_ms: 1000,
                         ..QuicServerParams::default()
                     },
                 )
@@ -115,6 +119,7 @@ impl Tpu {
                             max_connections_per_ipaddr_per_min: MAX_CONNECTIONS_PER_IPADDR_PER_MIN,
                             max_staked_connections,
                             max_unstaked_connections: 0, // Prevent unstaked nodes from forwarding transactions
+                            max_streams_per_ms: 1000, // match TPU socket; staked forwarders only
                             ..QuicServerParams::default()
                         },
                     )
