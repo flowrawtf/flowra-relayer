@@ -22,6 +22,7 @@ use jito_protos::{
         block_engine_relayer_client::BlockEngineRelayerClient, packet_batch_update::Msg,
         AccountsOfInterestRequest, AccountsOfInterestUpdate, ExpiringPacketBatch,
         PacketBatchUpdate, ProgramsOfInterestRequest, ProgramsOfInterestUpdate,
+        StartExpiringPacketStreamResponse,
     },
     convert::packet_to_proto_packet,
     packet::PacketBatch as ProtoPacketBatch,
@@ -327,7 +328,11 @@ impl BlockEngineRelayerHandler {
         // sender tracked as block_engine_relayer-loop_stats.block_engine_packet_sender_len
         let (block_engine_packet_sender, block_engine_packet_receiver) =
             channel(Self::BLOCK_ENGINE_PACKET_QUEUE_CAPACITY);
-        let _response = client
+        // Keep the response stream and actively drain it in the event loop. If it is
+        // never polled, the block engine's heartbeat replies eventually exhaust HTTP/2
+        // flow control, the engine's drain task blocks, and the whole packet path
+        // silently freezes with no reconnect (observed 2026-07-18 23:43 UTC).
+        let packet_stream_response = client
             .start_expiring_packet_stream(ReceiverStream::new(block_engine_packet_receiver))
             .await
             .map_err(|e| BlockEngineError::BlockEngineFailure(e.to_string()))?;
@@ -337,6 +342,7 @@ impl BlockEngineRelayerHandler {
             block_engine_receiver,
             subscribe_aoi_stream,
             subscribe_poi_stream,
+            packet_stream_response,
             auth_client,
             keypair,
             refresh_token,
@@ -356,6 +362,7 @@ impl BlockEngineRelayerHandler {
         block_engine_receiver: &mut Receiver<BlockEnginePackets>,
         subscribe_aoi_stream: Response<Streaming<AccountsOfInterestUpdate>>,
         subscribe_poi_stream: Response<Streaming<ProgramsOfInterestUpdate>>,
+        packet_stream_response: Response<Streaming<StartExpiringPacketStreamResponse>>,
         mut auth_client: AuthServiceClient<Channel>,
         keypair: &Arc<Keypair>,
         refresh_token: &mut Token,
@@ -368,6 +375,7 @@ impl BlockEngineRelayerHandler {
     ) -> BlockEngineResult<()> {
         let mut aoi_stream = subscribe_aoi_stream.into_inner();
         let mut poi_stream = subscribe_poi_stream.into_inner();
+        let mut packet_response_stream = packet_stream_response.into_inner();
 
         // drain old buffered packets before streaming packets to the block engine
         while block_engine_receiver.try_recv().is_ok() {}
@@ -380,6 +388,10 @@ impl BlockEngineRelayerHandler {
         let mut programs_of_interest: TimedCache<Pubkey, u8> =
             TimedCache::with_lifespan_and_capacity(aoi_cache_ttl_s, 1_000_000);
 
+        // When the block engine sends a "*" wildcard in its AOI/POI subscription,
+        // forward every (non-OFAC) transaction regardless of the account/program caches.
+        let mut forward_all = false;
+
         let mut block_engine_stats = BlockEngineStats::default();
 
         let mut heartbeat_interval = interval(Duration::from_millis(500));
@@ -387,8 +399,28 @@ impl BlockEngineRelayerHandler {
         let mut metrics_interval = interval(Duration::from_secs(1));
 
         let mut heartbeat_count = 0;
+        // Liveness watchdog: the engine replies to each of our heartbeats (2/s), so a
+        // long silence on the response stream means the link is dead even if the TCP
+        // connection is still up. Erroring out lets the outer loop reconnect.
+        const BLOCK_ENGINE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+        let mut last_response_at = Instant::now();
         while !exit.load(Ordering::Relaxed) {
             select! {
+                maybe_response = packet_response_stream.message() => {
+                    match maybe_response {
+                        Ok(Some(_heartbeat_reply)) => {
+                            last_response_at = Instant::now();
+                        }
+                        Ok(None) => {
+                            return Err(BlockEngineError::BlockEngineFailure(
+                                "block engine packet response stream closed".to_string(),
+                            ));
+                        }
+                        Err(e) => {
+                            return Err(BlockEngineError::BlockEngineFailure(e.to_string()));
+                        }
+                    }
+                }
                 _ = heartbeat_interval.tick() => {
                     trace!("sending heartbeat");
 
@@ -406,7 +438,7 @@ impl BlockEngineRelayerHandler {
 
                     let now = Instant::now();
 
-                    let num_pubkeys = Self::handle_aoi(maybe_aoi, &mut accounts_of_interest)?;
+                    let num_pubkeys = Self::handle_aoi(maybe_aoi, &mut accounts_of_interest, &mut forward_all)?;
 
                     block_engine_stats.increment_aoi_update_elapsed_us(now.elapsed().as_micros() as u64);
                     block_engine_stats.increment_aoi_update_count(1);
@@ -417,7 +449,7 @@ impl BlockEngineRelayerHandler {
 
                     let now = Instant::now();
 
-                    let num_pubkeys = Self::handle_poi(maybe_poi, &mut programs_of_interest)?;
+                    let num_pubkeys = Self::handle_poi(maybe_poi, &mut programs_of_interest, &mut forward_all)?;
 
                     block_engine_stats.increment_poi_update_elapsed_us(now.elapsed().as_micros() as u64);
                     block_engine_stats.increment_poi_update_count(1);
@@ -434,7 +466,7 @@ impl BlockEngineRelayerHandler {
                     let num_packets: u64 = block_engine_batches.banking_packet_batch.iter().map(|b|b.len() as u64).sum::<u64>();
                     block_engine_stats.increment_num_packets_received(num_packets);
 
-                    let filtered_packets = Self::filter_packets(block_engine_batches, num_packets, &mut accounts_of_interest, &mut programs_of_interest, address_lookup_table_cache, ofac_addresses);
+                    let filtered_packets = Self::filter_packets(block_engine_batches, num_packets, &mut accounts_of_interest, &mut programs_of_interest, address_lookup_table_cache, ofac_addresses, forward_all);
                     block_engine_stats.increment_packet_filter_elapsed_us(now.elapsed().as_micros() as u64);
 
                     if let Some(filtered_packets) = filtered_packets {
@@ -457,6 +489,12 @@ impl BlockEngineRelayerHandler {
                 rx = metrics_interval.tick() => {
                     trace!("flushing metrics");
                     block_engine_stats.increment_metrics_delay_us(rx.elapsed().as_micros() as u64);
+
+                    if last_response_at.elapsed() > BLOCK_ENGINE_RESPONSE_TIMEOUT {
+                        return Err(BlockEngineError::BlockEngineFailure(
+                            format!("no response from block engine in {:?}, reconnecting", BLOCK_ENGINE_RESPONSE_TIMEOUT),
+                        ));
+                    }
 
                     // removes expired items from aoi cache
                     let flush_start = Instant::now();
@@ -557,9 +595,15 @@ impl BlockEngineRelayerHandler {
     fn handle_aoi(
         maybe_msg: Result<Option<AccountsOfInterestUpdate>, Status>,
         accounts_of_interest: &mut TimedCache<Pubkey, u8>,
+        forward_all: &mut bool,
     ) -> BlockEngineResult<usize> {
         match maybe_msg {
             Ok(Some(aoi_update)) => {
+                // "*" is a wildcard: forward all transactions (no account filter).
+                if aoi_update.accounts.iter().any(|a| a == "*") {
+                    *forward_all = true;
+                }
+
                 let pubkeys: Vec<Pubkey> = aoi_update
                     .accounts
                     .iter()
@@ -584,9 +628,15 @@ impl BlockEngineRelayerHandler {
     fn handle_poi(
         maybe_msg: Result<Option<ProgramsOfInterestUpdate>, Status>,
         programs_of_interest: &mut TimedCache<Pubkey, u8>,
+        forward_all: &mut bool,
     ) -> BlockEngineResult<usize> {
         match maybe_msg {
             Ok(Some(poi_update)) => {
+                // "*" is a wildcard: forward all transactions (no program filter).
+                if poi_update.programs.iter().any(|a| a == "*") {
+                    *forward_all = true;
+                }
+
                 let pubkeys: Vec<Pubkey> = poi_update
                     .programs
                     .iter()
@@ -615,10 +665,16 @@ impl BlockEngineRelayerHandler {
     ) -> BlockEngineResult<usize> {
         let num_packets = batch.batch.as_ref().unwrap().packets.len();
 
+        // send_timeout instead of send: if the gRPC sender stops draining (engine not
+        // reading), a plain send().await would block this loop forever with no error
+        // and no reconnect. Timing out turns a stalled link into a clean reconnect.
         if let Err(e) = block_engine_packet_sender
-            .send(PacketBatchUpdate {
-                msg: Some(Msg::Batches(batch)),
-            })
+            .send_timeout(
+                PacketBatchUpdate {
+                    msg: Some(Msg::Batches(batch)),
+                },
+                Duration::from_secs(3),
+            )
             .await
         {
             error!("error forwarding packets {}", e);
@@ -638,6 +694,7 @@ impl BlockEngineRelayerHandler {
         programs_of_interest: &mut TimedCache<Pubkey, u8>,
         address_lookup_table_cache: &DashMap<Pubkey, AddressLookupTableAccount>,
         ofac_addresses: &HashSet<Pubkey>,
+        forward_all: bool,
     ) -> Option<ExpiringPacketBatch> {
         let mut filtered_packets = Vec::with_capacity(num_packets as usize);
 
@@ -649,7 +706,8 @@ impl BlockEngineRelayerHandler {
 
                 if let Ok(tx) = packet.deserialize_slice::<VersionedTransaction, _>(..) {
                     let is_forwardable = if ofac_addresses.is_empty() {
-                        is_aoi_in_static_keys(&tx, accounts_of_interest, programs_of_interest)
+                        forward_all
+                            || is_aoi_in_static_keys(&tx, accounts_of_interest, programs_of_interest)
                             || is_aoi_in_lookup_table(
                                 &tx,
                                 accounts_of_interest,
@@ -658,16 +716,18 @@ impl BlockEngineRelayerHandler {
                             )
                     } else {
                         !is_tx_ofac_related(&tx, ofac_addresses, address_lookup_table_cache)
-                            && (is_aoi_in_static_keys(
-                                &tx,
-                                accounts_of_interest,
-                                programs_of_interest,
-                            ) || is_aoi_in_lookup_table(
-                                &tx,
-                                accounts_of_interest,
-                                programs_of_interest,
-                                address_lookup_table_cache,
-                            ))
+                            && (forward_all
+                                || is_aoi_in_static_keys(
+                                    &tx,
+                                    accounts_of_interest,
+                                    programs_of_interest,
+                                )
+                                || is_aoi_in_lookup_table(
+                                    &tx,
+                                    accounts_of_interest,
+                                    programs_of_interest,
+                                    address_lookup_table_cache,
+                                ))
                     };
 
                     if is_forwardable {
@@ -701,11 +761,14 @@ impl BlockEngineRelayerHandler {
         heartbeat_count: &u64,
     ) -> BlockEngineResult<()> {
         if let Err(e) = block_engine_packet_sender
-            .send(PacketBatchUpdate {
-                msg: Some(Msg::Heartbeat(Heartbeat {
-                    count: *heartbeat_count,
-                })),
-            })
+            .send_timeout(
+                PacketBatchUpdate {
+                    msg: Some(Msg::Heartbeat(Heartbeat {
+                        count: *heartbeat_count,
+                    })),
+                },
+                Duration::from_secs(3),
+            )
             .await
         {
             error!("error sending heartbeat {}", e);
