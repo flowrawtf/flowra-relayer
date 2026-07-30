@@ -5,6 +5,7 @@ members = [
     "jito-protos",
     #    "packet_blaster", // TODO (LB): fix
     "relayer",
+    "relayer-probe",
     "rpc",
     "transaction-relayer",
     "web"
