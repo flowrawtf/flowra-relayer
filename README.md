@@ -58,6 +58,16 @@ cargo build --release --bin jito-transaction-relayer
 | `--block-engine-auth-service-url` | same as above | flowra-engine auth port (8003) |
 | `--packet-delay-ms` | `0` | Packet forwarding delay (upstream default was 50ms) |
 | `--keypair-path` | — | Relayer identity keypair (used for auth challenge signing) |
+| `--flowra-debug-telemetry` | off | Export metrics to `SOLANA_METRICS_CONFIG`. See below. |
+
+### Telemetry
+
+The relayer emits `datapoint_info!` measurements that upstream ships to whatever
+InfluxDB-compatible host `SOLANA_METRICS_CONFIG` names; ours names a Flowra collector,
+which writes them to ClickHouse. That export is off unless `--flowra-debug-telemetry`
+(env `FLOWRA_DEBUG_TELEMETRY=true`) is passed: without it the relayer clears
+`SOLANA_METRICS_CONFIG` at startup, so no point is written and no metrics host is
+contacted. Setting `SOLANA_METRICS_CONFIG` on its own does nothing but log a warning.
 
 ### Generating keys
 

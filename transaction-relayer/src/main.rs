@@ -208,6 +208,13 @@ struct Args {
     #[arg(long, env, value_delimiter = ' ', value_parser = Pubkey::from_str)]
     ofac_addresses: Option<Vec<Pubkey>>,
 
+    /// Export metrics to the host named by SOLANA_METRICS_CONFIG. Off by default: this fork
+    /// carries extra instrumentation that is only useful to whoever is debugging it, so
+    /// without this flag no data point is transmitted and no connection to a metrics host is
+    /// opened. SOLANA_METRICS_CONFIG alone does nothing.
+    #[arg(long, env)]
+    flowra_debug_telemetry: bool,
+
     /// Webserver bind address that exposes diagnostic information
     #[arg(long, env, default_value_t = SocketAddr::from_str("127.0.0.1:11227").unwrap())]
     webserver_bind_addr: SocketAddr,
@@ -330,6 +337,23 @@ fn main() {
 
     let args: Args = Args::parse();
     info!("args: {:?}", args);
+
+    // Decided before the first data point can be produced. solana-metrics is a published
+    // crate here, not ours to gate at the source, but it reads SOLANA_METRICS_CONFIG lazily
+    // the first time a point is submitted and has nowhere to send anything without it.
+    // Clearing it before that first submit is what makes "off" mean off: points are still
+    // formed and dropped in-process, but nothing is written and no metrics host is contacted.
+    if !args.flowra_debug_telemetry {
+        if std::env::var_os("SOLANA_METRICS_CONFIG").is_some() {
+            warn!(
+                "SOLANA_METRICS_CONFIG is set but metrics export is off; pass \
+                 --flowra-debug-telemetry to enable it"
+            );
+            std::env::remove_var("SOLANA_METRICS_CONFIG");
+        }
+    } else {
+        info!("debug telemetry enabled: metrics will be exported to SOLANA_METRICS_CONFIG");
+    }
 
     // Warn about deprecated args
     if args.cluster.is_some() {
