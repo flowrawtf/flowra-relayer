@@ -12,6 +12,10 @@ path = "src/main.rs"
 name = "pbp-check"
 path = "src/bin/pbp_check.rs"
 
+[[bin]]
+name = "engine-pbp-check"
+path = "src/bin/engine_pbp_check.rs"
+
 [dependencies]
 clap = { workspace = true }
 jito-protos = { workspace = true }
