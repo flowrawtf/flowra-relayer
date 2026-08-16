@@ -10,6 +10,7 @@ use std::{
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use jito_block_engine::block_engine::BlockEnginePackets;
+use log::error;
 use jito_relayer::relayer::RelayerPacketBatches;
 use agave_banking_stage_ingress_types::BankingPacketBatch;
 use solana_metrics::datapoint_info;
@@ -43,6 +44,10 @@ pub fn start_forward_and_delay_thread(
                 .spawn(move || {
                     let mut buffered_packet_batches: VecDeque<RelayerPacketBatches> =
                         VecDeque::with_capacity(100_000);
+                    // Latched once the block engine handler is gone. A closed channel never
+                    // reopens, so without this every batch would pay for a clone that is
+                    // immediately thrown away.
+                    let mut block_engine_gone = false;
 
                     let metrics_interval = Duration::from_secs(1);
                     let mut forwarder_metrics = ForwarderMetrics::new(
@@ -77,7 +82,7 @@ pub fn start_forward_and_delay_thread(
 
                                 // try_send because the block engine receiver only drains when it's connected
                                 // and we don't want to OOM on packet_receiver
-                                if !disable_mempool {
+                                if !disable_mempool && !block_engine_gone {
                                     match block_engine_sender.try_send(BlockEnginePackets {
                                         banking_packet_batch: banking_packet_batch.clone(),
                                         stamp: system_time,
@@ -88,9 +93,29 @@ pub fn start_forward_and_delay_thread(
                                                 num_packets;
                                         }
                                         Err(TrySendError::Closed(_)) => {
-                                            panic!(
-                                                "error sending packet batch to block engine handler"
+                                            // The handler is gone: either no block engine was
+                                            // configured (the receiver is dropped at startup,
+                                            // since it is moved into a closure that never runs)
+                                            // or its thread has exited.
+                                            //
+                                            // This used to panic, which took the whole relayer
+                                            // down with it. That is backwards. Forwarding to the
+                                            // fronted validator is the relayer's primary job and
+                                            // it is unaffected; the block engine leg is
+                                            // auxiliary, and the code already treats an
+                                            // unavailable engine as survivable one arm up, where
+                                            // a full queue is merely counted. Killing the process
+                                            // turns "bundles are not flowing" into "the
+                                            // validator receives nothing at all", which is
+                                            // strictly worse for the operator we exist to serve.
+                                            error!(
+                                                "block engine handler is gone; continuing to \
+                                                 forward to validators without it"
                                             );
+                                            block_engine_gone = true;
+                                            forwarder_metrics.num_be_packets_dropped +=
+                                                num_packets;
+                                            forwarder_metrics.num_be_sender_closed += 1;
                                         }
                                         Err(TrySendError::Full(_)) => {
                                             // block engine most likely not connected
@@ -148,6 +173,10 @@ struct ForwarderMetrics {
     pub num_be_packets_forwarded: u64,
     pub num_be_packets_dropped: u64,
     pub num_be_sender_full: u64,
+    /// Times the block engine handler was found gone. Distinct from `full`: a full queue means
+    /// the engine is slow or disconnected but the handler is alive and will drain again, while
+    /// closed means nothing will ever drain and the leg is down until restart.
+    pub num_be_sender_closed: u64,
 
     pub num_relayer_packets_forwarded: u64,
 
@@ -172,6 +201,7 @@ impl ForwarderMetrics {
             num_be_packets_forwarded: 0,
             num_be_packets_dropped: 0,
             num_be_sender_full: 0,
+            num_be_sender_closed: 0,
             num_relayer_packets_forwarded: 0,
             buffered_packet_batches_max_len: 0,
             buffered_packet_batches_capacity,
@@ -219,6 +249,7 @@ impl ForwarderMetrics {
             ),
             ("num_be_packets_dropped", self.num_be_packets_dropped, i64),
             ("num_be_sender_full", self.num_be_sender_full, i64),
+            ("num_be_sender_closed", self.num_be_sender_closed, i64),
             // Relayer -> validator metrics
             (
                 "num_relayer_packets_forwarded",
