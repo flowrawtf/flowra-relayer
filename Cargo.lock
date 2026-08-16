@@ -5846,10 +5846,16 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 name = "relayer-probe"
 version = "0.4.2"
 dependencies = [
+ "bincode",
  "clap 4.6.6",
  "jito-protos",
+ "solana-hash 4.5.0",
+ "solana-instruction",
  "solana-keypair",
+ "solana-pubkey 4.2.1",
  "solana-signer",
+ "solana-streamer",
+ "solana-transaction",
  "tokio",
  "tonic 0.10.2",
 ]
@@ -7992,6 +7998,7 @@ dependencies = [
  "bytemuck",
  "bytemuck_derive",
  "five8",
+ "rand 0.9.5",
  "serde",
  "serde_derive",
  "solana-atomic-u64",

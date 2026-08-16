@@ -8,9 +8,19 @@ publish = false
 name = "relayer-probe"
 path = "src/main.rs"
 
+[[bin]]
+name = "pbp-check"
+path = "src/bin/pbp_check.rs"
+
 [dependencies]
 clap = { workspace = true }
 jito-protos = { workspace = true }
+solana-hash = { workspace = true }
+solana-instruction = { workspace = true }
+solana-pubkey = { workspace = true }
+solana-transaction = { workspace = true }
+solana-streamer = { workspace = true, features = ["dev-context-only-utils"] }
+bincode = { workspace = true }
 solana-keypair = { workspace = true }
 solana-signer = { workspace = true }
 tokio = { workspace = true }
