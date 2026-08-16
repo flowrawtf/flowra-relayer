@@ -28,10 +28,10 @@ use log::*;
 use prost_types::Timestamp;
 use agave_banking_stage_ingress_types::BankingPacketBatch;
 use solana_metrics::datapoint_info;
-use solana_sdk::{
-    address_lookup_table::AddressLookupTableAccount, clock::Slot, pubkey::Pubkey,
-    saturating_add_assign, transaction::VersionedTransaction,
-};
+use solana_message::AddressLookupTableAccount;
+use solana_clock::Slot;
+use solana_pubkey::Pubkey;
+use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
 use tokio::sync::mpsc::{channel, error::TrySendError, Sender as TokioSender};
 use tokio_stream::wrappers::ReceiverStream;
@@ -139,7 +139,10 @@ impl RelayerMetrics {
     fn increment_packets_forwarded(&mut self, validator_id: &Pubkey, num_packets: u64) {
         self.packet_stats_per_validator
             .entry(*validator_id)
-            .and_modify(|entry| saturating_add_assign!(entry.num_packets_forwarded, num_packets))
+            .and_modify(|entry| {
+                entry.num_packets_forwarded =
+                    entry.num_packets_forwarded.saturating_add(num_packets)
+            })
             .or_insert(PacketForwardStats {
                 num_packets_forwarded: num_packets,
                 num_packets_dropped: 0,
@@ -149,7 +152,10 @@ impl RelayerMetrics {
     fn increment_packets_dropped(&mut self, validator_id: &Pubkey, num_packets: u64) {
         self.packet_stats_per_validator
             .entry(*validator_id)
-            .and_modify(|entry| saturating_add_assign!(entry.num_packets_dropped, num_packets))
+            .and_modify(|entry| {
+                entry.num_packets_dropped =
+                    entry.num_packets_dropped.saturating_add(num_packets)
+            })
             .or_insert(PacketForwardStats {
                 num_packets_forwarded: 0,
                 num_packets_dropped: num_packets,
@@ -654,7 +660,10 @@ impl RelayerImpl {
                     .filter(|p| !p.meta().discard())
                     .filter_map(|packet| {
                         if !ofac_addresses.is_empty() {
-                            let tx: VersionedTransaction = packet.deserialize_slice(..).ok()?;
+                            // The published solana-perf 4.2.1 has no deserialize_slice on
+                            // PacketRef, so go through the bytes.
+                            let tx: VersionedTransaction =
+                                bincode::deserialize(packet.data(..)?).ok()?;
                             if !is_tx_ofac_related(&tx, ofac_addresses, address_lookup_table_cache)
                             {
                                 Some(packet)

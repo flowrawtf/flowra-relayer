@@ -1,10 +1,9 @@
 use std::collections::HashSet;
 
 use dashmap::DashMap;
-use solana_sdk::{
-    address_lookup_table::AddressLookupTableAccount, pubkey::Pubkey,
-    transaction::VersionedTransaction,
-};
+use solana_message::AddressLookupTableAccount;
+use solana_pubkey::Pubkey;
+use solana_transaction::versioned::VersionedTransaction;
 
 /// Returns true if transaction is ofac-related, false if not
 pub fn is_tx_ofac_related(
@@ -58,17 +57,15 @@ mod tests {
     use std::collections::HashSet;
 
     use dashmap::DashMap;
-    use solana_sdk::{
-        address_lookup_table::AddressLookupTableAccount,
-        hash::Hash,
-        instruction::{AccountMeta, CompiledInstruction, Instruction},
-        message::{v0, v0::MessageAddressTableLookup, MessageHeader, VersionedMessage},
-        packet::Packet,
-        pubkey::Pubkey,
-        signature::Signer,
-        signer::keypair::Keypair,
-        transaction::{Transaction, VersionedTransaction},
-    };
+    use solana_message::AddressLookupTableAccount;
+    use solana_hash::Hash;
+    use solana_instruction::{AccountMeta, Instruction};
+    use solana_keypair::Keypair;
+    use solana_message::{compiled_instruction::CompiledInstruction, v0, v0::MessageAddressTableLookup, MessageHeader, VersionedMessage};
+    use solana_packet::Packet;
+    use solana_pubkey::Pubkey;
+    use solana_signer::Signer;
+    use solana_transaction::{versioned::VersionedTransaction, Transaction};
 
     use crate::ofac::{
         is_ofac_address_in_lookup_table, is_ofac_address_in_static_keys, is_tx_ofac_related,

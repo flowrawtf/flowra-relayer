@@ -30,7 +30,12 @@ solana-client = { workspace = true }
 solana-core = { workspace = true }
 solana-metrics = { workspace = true }
 solana-perf = { workspace = true }
-solana-sdk = { workspace = true }
+solana-message = { workspace = true }
+solana-signature = { workspace = true }
+bincode = { workspace = true }
+solana-clock = { workspace = true }
+solana-pubkey = { workspace = true }
+solana-transaction = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

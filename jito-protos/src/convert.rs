@@ -1,8 +1,10 @@
-use solana_perf::packet::Packet;
+use solana_perf::packet::PacketRef;
 
 use crate::packet::{Meta as ProtoMeta, Packet as ProtoPacket, PacketFlags as ProtoPacketFlags};
 
-pub fn packet_to_proto_packet(p: &Packet) -> Option<ProtoPacket> {
+/// Takes a `PacketRef` rather than `&Packet`: a 4.2 `PacketBatch` may hold pinned or
+/// `Bytes`-backed packets, and its iterators hand out the ref enum for either.
+pub fn packet_to_proto_packet(p: PacketRef<'_>) -> Option<ProtoPacket> {
     Some(ProtoPacket {
         data: p.data(..)?.to_vec(),
         meta: Some(ProtoMeta {

@@ -12,7 +12,7 @@ use std::{
 use jito_rpc::load_balancer::LoadBalancer;
 use log::warn;
 use solana_client::client_error;
-use solana_sdk::pubkey::Pubkey;
+use solana_pubkey::Pubkey;
 use solana_streamer::streamer::StakedNodes;
 
 const PK_TO_STAKE_REFRESH_DURATION: Duration = Duration::from_secs(5);

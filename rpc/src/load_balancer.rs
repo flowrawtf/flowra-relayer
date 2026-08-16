@@ -13,10 +13,8 @@ use dashmap::DashMap;
 use log::{error, info};
 use solana_client::{pubsub_client::PubsubClient, rpc_client::RpcClient};
 use solana_metrics::{datapoint_error, datapoint_info};
-use solana_sdk::{
-    clock::Slot,
-    commitment_config::{CommitmentConfig, CommitmentLevel},
-};
+use solana_clock::Slot;
+use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 
 pub struct LoadBalancer {
     /// (ws_url, slot)

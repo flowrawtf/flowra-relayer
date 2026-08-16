@@ -32,10 +32,11 @@ use log::{error, *};
 use prost_types::Timestamp;
 use agave_banking_stage_ingress_types::BankingPacketBatch;
 use solana_metrics::{datapoint_error, datapoint_info};
-use solana_sdk::{
-    address_lookup_table::AddressLookupTableAccount, pubkey::Pubkey, signature::Signer,
-    signer::keypair::Keypair, transaction::VersionedTransaction,
-};
+use solana_message::AddressLookupTableAccount;
+use solana_keypair::Keypair;
+use solana_pubkey::Pubkey;
+use solana_signer::Signer;
+use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
 use tokio::{
     runtime::Runtime,
@@ -704,31 +705,24 @@ impl BlockEngineRelayerHandler {
                     continue;
                 }
 
-                if let Ok(tx) = packet.deserialize_slice::<VersionedTransaction, _>(..) {
-                    let is_forwardable = if ofac_addresses.is_empty() {
-                        forward_all
-                            || is_aoi_in_static_keys(&tx, accounts_of_interest, programs_of_interest)
-                            || is_aoi_in_lookup_table(
-                                &tx,
-                                accounts_of_interest,
-                                programs_of_interest,
-                                address_lookup_table_cache,
-                            )
-                    } else {
-                        !is_tx_ofac_related(&tx, ofac_addresses, address_lookup_table_cache)
-                            && (forward_all
-                                || is_aoi_in_static_keys(
-                                    &tx,
-                                    accounts_of_interest,
-                                    programs_of_interest,
-                                )
-                                || is_aoi_in_lookup_table(
-                                    &tx,
-                                    accounts_of_interest,
-                                    programs_of_interest,
-                                    address_lookup_table_cache,
-                                ))
-                    };
+                if let Some(Ok(tx)) = packet
+                    .data(..)
+                    .map(bincode::deserialize::<VersionedTransaction>)
+                {
+                    if !ofac_addresses.is_empty()
+                        && is_tx_ofac_related(&tx, ofac_addresses, address_lookup_table_cache)
+                    {
+                        continue;
+                    }
+
+                    let is_forwardable = forward_all
+                        || is_aoi_in_static_keys(&tx, accounts_of_interest, programs_of_interest)
+                        || is_aoi_in_lookup_table(
+                            &tx,
+                            accounts_of_interest,
+                            programs_of_interest,
+                            address_lookup_table_cache,
+                        );
 
                     if is_forwardable {
                         if let Some(packet) = packet_to_proto_packet(packet) {

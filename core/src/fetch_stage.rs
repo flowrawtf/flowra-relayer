@@ -12,7 +12,7 @@ use std::{
 use crossbeam_channel::{RecvError, RecvTimeoutError, SendError};
 use solana_metrics::{datapoint_error, datapoint_info};
 use solana_perf::packet::PacketBatch;
-use solana_sdk::packet::{Packet, PacketFlags};
+use solana_packet::PacketFlags;
 use solana_streamer::streamer::{PacketBatchReceiver, PacketBatchSender};
 
 #[derive(Debug, thiserror::Error)]
@@ -93,18 +93,22 @@ impl FetchStage {
         tpu_forwards_receiver: &PacketBatchReceiver,
         tpu_sender: &PacketBatchSender,
     ) -> FetchStageResult<()> {
-        let mark_forwarded = |packet: &mut Packet| {
-            packet.meta_mut().flags |= PacketFlags::FORWARDED;
-        };
+        // `PacketBatch` is an enum of pinned/bytes/single batches in 4.2, so its iterator
+        // yields `PacketRefMut` rather than `&mut Packet`.
+        fn mark_forwarded(batch: &mut PacketBatch) {
+            for mut packet in batch.iter_mut() {
+                packet.meta_mut().flags |= PacketFlags::FORWARDED;
+            }
+        }
 
         let mut packet_batch = tpu_forwards_receiver.recv()?;
         let mut num_packets = packet_batch.len();
-        packet_batch.iter_mut().for_each(mark_forwarded);
+        mark_forwarded(&mut packet_batch);
 
         let mut packet_batches = vec![packet_batch];
         while let Ok(mut packet_batch) = tpu_forwards_receiver.try_recv() {
             num_packets += packet_batch.len();
-            packet_batch.iter_mut().for_each(mark_forwarded);
+            mark_forwarded(&mut packet_batch);
             packet_batches.push(packet_batch);
             // Read at most 1K transactions in a loop
             if num_packets > 1024 {

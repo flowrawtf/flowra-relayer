@@ -21,7 +21,7 @@ use log::*;
 use openssl::pkey::{Private, Public};
 use prost_types::Timestamp;
 use rand::{distributions::Alphanumeric, Rng};
-use solana_sdk::pubkey::Pubkey;
+use solana_pubkey::Pubkey;
 use tokio::{task::JoinHandle, time::interval};
 use tonic::{Request, Response, Status};
 
@@ -171,7 +171,7 @@ impl<V: ValidatorAuther> AuthService for AuthServiceImpl<V> {
             return Err(Status::invalid_argument("Role must be validator."));
         }
 
-        if inner_req.pubkey.len() != solana_sdk::pubkey::PUBKEY_BYTES {
+        if inner_req.pubkey.len() != solana_pubkey::PUBKEY_BYTES {
             return Err(Status::invalid_argument(
                 "Pubkey must be 32 bytes in length",
             ));
@@ -251,7 +251,7 @@ impl<V: ValidatorAuther> AuthService for AuthServiceImpl<V> {
             )));
         }
 
-        if inner_req.signed_challenge.len() != solana_sdk::signature::SIGNATURE_BYTES {
+        if inner_req.signed_challenge.len() != solana_signature::SIGNATURE_BYTES {
             return Err(Status::invalid_argument("Signature must be 64 bytes."));
         }
         let signed_challenge = {

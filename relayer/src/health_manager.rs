@@ -10,7 +10,7 @@ use std::{
 
 use crossbeam_channel::{select, tick, Receiver, Sender};
 use solana_metrics::datapoint_info;
-use solana_sdk::clock::Slot;
+use solana_clock::Slot;
 
 #[derive(PartialEq, Eq, Copy, Clone)]
 pub enum HealthState {

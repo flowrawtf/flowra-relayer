@@ -14,4 +14,5 @@ dashmap = { workspace = true }
 log = { workspace = true }
 solana-client = { workspace = true }
 solana-metrics = { workspace = true }
-solana-sdk = { workspace = true }
+solana-clock = { workspace = true }
+solana-commitment-config = { workspace = true }

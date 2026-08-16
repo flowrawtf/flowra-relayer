@@ -1,6 +1,7 @@
 // One-shot Solana keypair generator: writes a keypair JSON to the given path
 // and prints its base58 pubkey. Usage: cargo run -p relayer-probe --example genkey -- <out_path>
-use solana_sdk::signature::{write_keypair_file, Keypair, Signer};
+use solana_keypair::{write_keypair_file, Keypair};
+use solana_signer::Signer;
 
 fn main() {
     let path = std::env::args()

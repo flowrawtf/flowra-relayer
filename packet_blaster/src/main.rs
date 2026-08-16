@@ -93,7 +93,7 @@ enum Mode {
         num_connections: u64,
 
         /// Number of streams per connection.
-        #[arg(long, env, default_value_t = solana_sdk::quic::QUIC_MAX_UNSTAKED_CONCURRENT_STREAMS as u64)]
+        #[arg(long, env, default_value_t = solana_streamer::nonblocking::swqos::QUIC_MAX_UNSTAKED_CONCURRENT_STREAMS as u64)]
         num_streams_per_conn: u64,
     },
 }
@@ -101,7 +101,7 @@ enum Mode {
 fn read_keypairs(path: PathBuf) -> io::Result<Vec<Keypair>> {
     if path.is_dir() {
         let result = fs::read_dir(path)?
-            .filter_map(|entry| solana_sdk::signature::read_keypair_file(entry.ok()?.path()).ok())
+            .filter_map(|entry| solana_keypair::read_keypair_file(entry.ok()?.path()).ok())
             .collect::<Vec<_>>();
         Ok(result)
     } else {
@@ -290,7 +290,7 @@ pub enum PacketBlasterError {
     #[error("write error: {0}")]
     WriteError(#[from] quinn::WriteError),
     #[error("transport error: {0}")]
-    TransportError(#[from] solana_sdk::transport::TransportError),
+    TransportError(#[from] solana_transaction_error::TransportError),
 }
 
 impl TpuSender {
@@ -317,11 +317,11 @@ impl TpuSender {
 
         let mut transport_config = quinn::TransportConfig::default();
         let timeout = quinn::IdleTimeout::from(quinn::VarInt::from_u32(
-            solana_sdk::quic::QUIC_MAX_TIMEOUT_MS * 100, /* Hack for when relayer is backed up and not accepting connections */
+            solana_streamer::quic::QUIC_MAX_TIMEOUT_MS * 100, /* Hack for when relayer is backed up and not accepting connections */
         ));
         transport_config.max_idle_timeout(Some(timeout));
         transport_config.keep_alive_interval(Some(Duration::from_millis(
-            solana_sdk::quic::QUIC_KEEP_ALIVE_MS,
+            solana_streamer::quic::QUIC_KEEP_ALIVE_MS,
         )));
         config.transport_config(Arc::new(transport_config));
 

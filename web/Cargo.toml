@@ -14,6 +14,6 @@ jito-relayer = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-solana-sdk = { workspace = true }
+solana-pubkey = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }

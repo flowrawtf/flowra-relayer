@@ -5,7 +5,7 @@ use jwt::{AlgorithmType, Header, PKeyWithDigest, Token, Verified, VerifyWithKey}
 use log::*;
 use openssl::pkey::Public;
 use serde::{Deserialize, Serialize};
-use solana_sdk::pubkey::Pubkey;
+use solana_pubkey::Pubkey;
 use tonic::{metadata::MetadataMap, service::Interceptor, Request, Status};
 
 /// What the JWT token will be encoded with.

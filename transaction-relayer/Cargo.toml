@@ -30,14 +30,18 @@ openssl = { workspace = true }
 prost-types = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
-solana-address-lookup-table-program = { workspace = true }
+
 solana-client = { workspace = true }
 solana-core = { workspace = true }
 solana-metrics = { workspace = true }
 solana-net-utils = { workspace = true }
 solana-perf = { workspace = true }
-solana-program = { workspace = true }
-solana-sdk = { workspace = true }
+solana-address-lookup-table-interface = { workspace = true }
+solana-message = { workspace = true }
+solana-keypair = { workspace = true }
+solana-pubkey = { workspace = true }
+solana-signer = { workspace = true }
+solana-streamer = { workspace = true }
 tikv-jemallocator = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

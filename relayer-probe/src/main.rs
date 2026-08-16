@@ -26,9 +26,8 @@ use jito_protos::{
         relayer_client::RelayerClient, subscribe_packets_response::Msg, SubscribePacketsRequest,
     },
 };
-use solana_sdk::{
-    signature::{read_keypair_file, Signer},
-};
+use solana_keypair::read_keypair_file;
+use solana_signer::Signer;
 use tonic::{
     metadata::MetadataValue,
     transport::{Channel, ClientTlsConfig, Endpoint},

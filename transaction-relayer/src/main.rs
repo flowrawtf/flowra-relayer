@@ -1,4 +1,4 @@
-use solana_net_utils::SocketConfig;
+use solana_net_utils::sockets::SocketConfiguration;
 use std::{
     collections::HashSet,
     fs,
@@ -42,12 +42,12 @@ use jwt::{AlgorithmType, PKeyWithDigest};
 use log::{debug, error, info, warn};
 use openssl::{hash::MessageDigest, pkey::PKey};
 use solana_metrics::{datapoint_error, datapoint_info};
-use solana_net_utils::multi_bind_in_range_with_config;
-use solana_program::address_lookup_table::{state::AddressLookupTable, AddressLookupTableAccount};
-use solana_sdk::{
-    pubkey::Pubkey,
-    signature::{read_keypair_file, Signer},
-};
+use solana_net_utils::sockets::multi_bind_in_range_with_config;
+use solana_address_lookup_table_interface::state::AddressLookupTable;
+use solana_message::AddressLookupTableAccount;
+use solana_keypair::read_keypair_file;
+use solana_pubkey::Pubkey;
+use solana_signer::Signer;
 use tikv_jemallocator::Jemalloc;
 use tokio::{runtime::Builder, signal, sync::mpsc::channel};
 use tonic::transport::Server;
@@ -292,7 +292,7 @@ fn get_sockets(args: &Args) -> Sockets {
             let (port, mut sock) = multi_bind_in_range_with_config(
                 IpAddr::V4(Ipv4Addr::from([0, 0, 0, 0])),
                 (tpu_ports.start + i, tpu_ports.start + 1 + i),
-                SocketConfig::default().reuseport(true),
+                SocketConfiguration::default(),
                 1,
             )
             .unwrap();
@@ -306,7 +306,7 @@ fn get_sockets(args: &Args) -> Sockets {
             let (port, mut sock) = multi_bind_in_range_with_config(
                 IpAddr::V4(Ipv4Addr::from([0, 0, 0, 0])),
                 (tpu_fwd_ports.start + i, tpu_fwd_ports.start + 1 + i),
-                SocketConfig::default().reuseport(true),
+                SocketConfiguration::default(),
                 1,
             )
             .unwrap();
@@ -372,7 +372,11 @@ fn main() {
             "Contacting {} to determine the validator's public IP address",
             entrypoint
         );
-        solana_net_utils::get_public_ip_addr(&entrypoint).expect("get public ip address")
+        solana_net_utils::get_public_ip_addr_with_binding(
+            &entrypoint,
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        )
+        .expect("get public ip address")
     };
 
     info!("public ip: {:?}", public_ip);
