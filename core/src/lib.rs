@@ -13,6 +13,7 @@ use log::*;
 
 mod fetch_stage;
 pub mod ofac;
+pub mod pbp;
 mod sigverify_stage;
 mod staked_nodes_updater_service;
 pub mod tpu;

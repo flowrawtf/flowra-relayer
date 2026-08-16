@@ -32,7 +32,7 @@ use jito_relayer::{
     auth_interceptor::AuthInterceptor,
     auth_service::{AuthServiceImpl, ValidatorAuther},
     health_manager::HealthManager,
-    relayer::RelayerImpl,
+    relayer::{RelayerImpl, ValidatorPolicies},
     schedule_cache::{LeaderScheduleCacheUpdater, LeaderScheduleUpdatingHandle},
 };
 use jito_relayer_web::{start_relayer_web_server, RelayerState};
@@ -468,6 +468,7 @@ fn main() {
         .unwrap_or_default();
     info!("ofac addresses: {:?}", ofac_addresses);
 
+
     let (rpc_load_balancer, slot_receiver) = LoadBalancer::new(&servers, &exit);
     let rpc_load_balancer = Arc::new(rpc_load_balancer);
 
@@ -543,6 +544,11 @@ fn main() {
     } else {
         None
     };
+    // Per-validator PBP policy, written by the gRPC handler and read by the forwarding thread.
+    // There is deliberately no file to seed it from: a drop the relayer cannot attribute to an
+    // authenticated validator has nobody accountable for it.
+    let validator_policies: ValidatorPolicies = Arc::new(DashMap::new());
+
     let block_engine_forwarder = BlockEngineRelayerHandler::new(
         block_engine_config,
         block_engine_receiver,
@@ -576,6 +582,7 @@ fn main() {
         health_manager.handle(),
         exit.clone(),
         ofac_addresses,
+        validator_policies,
         address_lookup_table_cache,
         args.validator_packet_batch_size,
         args.forward_all,

@@ -467,7 +467,7 @@ impl BlockEngineRelayerHandler {
                     let num_packets: u64 = block_engine_batches.banking_packet_batch.iter().map(|b|b.len() as u64).sum::<u64>();
                     block_engine_stats.increment_num_packets_received(num_packets);
 
-                    let filtered_packets = Self::filter_packets(block_engine_batches, num_packets, &mut accounts_of_interest, &mut programs_of_interest, address_lookup_table_cache, ofac_addresses, forward_all);
+                    let filtered_packets = Self::filter_packets(block_engine_batches, num_packets, &mut accounts_of_interest, &mut programs_of_interest, address_lookup_table_cache, ofac_addresses, forward_all, &mut block_engine_stats);
                     block_engine_stats.increment_packet_filter_elapsed_us(now.elapsed().as_micros() as u64);
 
                     if let Some(filtered_packets) = filtered_packets {
@@ -687,7 +687,9 @@ impl BlockEngineRelayerHandler {
         }
     }
 
-    /// Filters out packets that aren't on list of interest
+    /// Drops OFAC packets, then filters out what isn't on a list of
+    /// interest.
+    #[allow(clippy::too_many_arguments)]
     fn filter_packets(
         block_engine_batches: BlockEnginePackets,
         num_packets: u64,
@@ -696,6 +698,7 @@ impl BlockEngineRelayerHandler {
         address_lookup_table_cache: &DashMap<Pubkey, AddressLookupTableAccount>,
         ofac_addresses: &HashSet<Pubkey>,
         forward_all: bool,
+        block_engine_stats: &mut BlockEngineStats,
     ) -> Option<ExpiringPacketBatch> {
         let mut filtered_packets = Vec::with_capacity(num_packets as usize);
 
@@ -709,9 +712,15 @@ impl BlockEngineRelayerHandler {
                     .data(..)
                     .map(bincode::deserialize::<VersionedTransaction>)
                 {
+                    // Drops come first, and they are unconditional. This leg and the validator-
+                    // facing leg in `relayer::forward_packets` are two copies of the same
+                    // sigverified stream that rejoin at the same banking stage, so a transaction
+                    // dropped there and forwarded here still reaches the block -- the rule has to
+                    // hold on both or it holds on neither.
                     if !ofac_addresses.is_empty()
                         && is_tx_ofac_related(&tx, ofac_addresses, address_lookup_table_cache)
                     {
+                        block_engine_stats.increment_num_packets_dropped_ofac(1);
                         continue;
                     }
 

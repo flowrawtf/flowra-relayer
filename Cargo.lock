@@ -3974,6 +3974,7 @@ dependencies = [
  "solana-metrics",
  "solana-perf",
  "solana-pubkey 4.2.1",
+ "solana-sha256-hasher",
  "solana-signature",
  "solana-transaction",
  "thiserror 1.0.69",
