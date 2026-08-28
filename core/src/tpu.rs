@@ -131,9 +131,11 @@ impl Tpu {
                         max_connections_per_staked_peer: MAX_QUIC_CONNECTIONS_PER_PEER,
                         max_connections_per_unstaked_peer: MAX_QUIC_CONNECTIONS_PER_PEER,
                         // Dedicated relayer box: lift per-interval stream budget well above the
-                        // validator self-protective default (250) so legit staked TPU flow isn't
-                        // throttled during leader windows. 1000/ms = 100k units / 100ms interval.
-                        max_streams_per_ms: 1000,
+                        // validator self-protective default (250) so legit TPU flow isn't
+                        // throttled during leader windows. Sized so the unstaked pool keeps a
+                        // usable per-connection allowance at max_unstaked_connections=2000.
+                        // 4000/ms = 400k units / 100ms interval.
+                        max_streams_per_ms: 4000,
                     },
                     cancel.clone(),
                 )
@@ -159,7 +161,7 @@ impl Tpu {
                             max_unstaked_connections: 0, // Prevent unstaked nodes from forwarding transactions
                             max_connections_per_staked_peer: MAX_QUIC_CONNECTIONS_PER_PEER,
                             max_connections_per_unstaked_peer: MAX_QUIC_CONNECTIONS_PER_PEER,
-                            max_streams_per_ms: 1000, // match TPU socket; staked forwarders only
+                            max_streams_per_ms: 4000, // match TPU socket; staked forwarders only
                         },
                         cancel.clone(),
                     )
