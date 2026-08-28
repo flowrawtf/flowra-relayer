@@ -32,7 +32,10 @@ use crate::{
 pub const MAX_QUIC_CONNECTIONS_PER_IP: usize = 8;
 pub const MAX_CONNECTIONS_PER_IPADDR_PER_MIN: u64 = 64;
 /// Matches the validator's own per-peer allowance.
-pub const MAX_QUIC_CONNECTIONS_PER_PEER: usize = 8;
+// Front-door for an entire validator's TPU flow: allow heavy senders to scale
+// past the 200 TPS/connection unstaked allowance with parallel connections
+// (agave default is 8; connection table and CPU have ample headroom here).
+pub const MAX_QUIC_CONNECTIONS_PER_PEER: usize = 16;
 /// Number of threads verifying signatures on the TPU ingress.
 const SIGVERIFY_WORKERS: usize = 4;
 
