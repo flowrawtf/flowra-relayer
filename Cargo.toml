@@ -101,3 +101,9 @@ lto = "thin"
 # enable debug symbols for profiling the heap using jeprof
 # example: jeprof --web target/release/jito-transaction-relayer jeprof.3085546.9823.i24.heap
 #debug = true
+
+[patch.crates-io]
+# Vendored with one change: MAX_UNSTAKED_TPS 200 -> 500 (see the note at the constant in
+# vendor/solana-streamer/src/nonblocking/stream_throttle.rs). Applies to every crate in the
+# graph that consumes solana-streamer, which is the point: the whole box fronts one validator.
+solana-streamer = { path = "vendor/solana-streamer" }

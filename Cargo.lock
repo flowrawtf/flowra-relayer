@@ -9585,8 +9585,6 @@ dependencies = [
 [[package]]
 name = "solana-streamer"
 version = "4.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3383a0d01e0731c3cf3e6bfdef6928d56c0a604db39adc7256b4f1e643715d11"
 dependencies = [
  "agave-xdp",
  "bytes",

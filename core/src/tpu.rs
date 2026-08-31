@@ -31,11 +31,11 @@ use crate::{
 // allow multiple connections for NAT and any open/close overlap
 pub const MAX_QUIC_CONNECTIONS_PER_IP: usize = 8;
 pub const MAX_CONNECTIONS_PER_IPADDR_PER_MIN: u64 = 64;
-/// Matches the validator's own per-peer allowance.
 // Front-door for an entire validator's TPU flow: allow heavy senders to scale
-// past the 200 TPS/connection unstaked allowance with parallel connections
+// past the per-connection unstaked allowance with parallel connections
 // (agave default is 8; connection table and CPU have ample headroom here).
-pub const MAX_QUIC_CONNECTIONS_PER_PEER: usize = 16;
+// With the vendored streamer's 500 TPS/connection, 32 conns = 16k TPS per IP.
+pub const MAX_QUIC_CONNECTIONS_PER_PEER: usize = 32;
 /// Number of threads verifying signatures on the TPU ingress.
 const SIGVERIFY_WORKERS: usize = 4;
 
@@ -135,10 +135,10 @@ impl Tpu {
                         max_connections_per_unstaked_peer: MAX_QUIC_CONNECTIONS_PER_PEER,
                         // Dedicated relayer box: lift per-interval stream budget well above the
                         // validator self-protective default (250) so legit TPU flow isn't
-                        // throttled during leader windows. Sized so the unstaked pool keeps a
-                        // usable per-connection allowance at max_unstaked_connections=2000.
-                        // 4000/ms = 400k units / 100ms interval.
-                        max_streams_per_ms: 4000,
+                        // throttled during leader windows. 8000/ms keeps the staked pool's
+                        // share ahead of the raised unstaked per-connection allowance (500 TPS
+                        // via the vendored streamer) at max_unstaked_connections=4000.
+                        max_streams_per_ms: 8000,
                     },
                     cancel.clone(),
                 )
@@ -164,7 +164,7 @@ impl Tpu {
                             max_unstaked_connections: 0, // Prevent unstaked nodes from forwarding transactions
                             max_connections_per_staked_peer: MAX_QUIC_CONNECTIONS_PER_PEER,
                             max_connections_per_unstaked_peer: MAX_QUIC_CONNECTIONS_PER_PEER,
-                            max_streams_per_ms: 4000, // match TPU socket; staked forwarders only
+                            max_streams_per_ms: 8000, // match TPU socket; staked forwarders only
                         },
                         cancel.clone(),
                     )
