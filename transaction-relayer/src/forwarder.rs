@@ -14,9 +14,17 @@ use log::error;
 use jito_relayer::relayer::RelayerPacketBatches;
 use agave_banking_stage_ingress_types::BankingPacketBatch;
 use solana_metrics::datapoint_info;
-use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::broadcast;
 
-pub const BLOCK_ENGINE_FORWARDER_QUEUE_CAPACITY: usize = 5_000;
+/// Ring capacity of the block-engine leg, in batches (drop-oldest on overflow).
+///
+/// Same reasoning as the validator-facing ring: this queue sits in front of a consumer that
+/// stalls whenever the block engine is slow, and mempool data that waited behind a full queue
+/// is of no use to a searcher. It was a 5,000-deep bounded mpsc that dropped the NEWEST batch,
+/// so once it filled -- which on the busier relayer it did permanently, 5,000/5,000 with tens
+/// of thousands of packets shed per hour -- the engine saw only the stale head of the queue and
+/// never the current mempool.
+pub const BLOCK_ENGINE_FORWARDER_QUEUE_CAPACITY: usize = 2_048;
 
 /// Forwards packets to the Block Engine handler thread.
 /// Delays transactions for packet_delay_ms before forwarding them to the validator.
@@ -24,7 +32,7 @@ pub fn start_forward_and_delay_thread(
     verified_receiver: Receiver<BankingPacketBatch>,
     delay_packet_sender: Sender<RelayerPacketBatches>,
     packet_delay_ms: u32,
-    block_engine_sender: tokio::sync::mpsc::Sender<BlockEnginePackets>,
+    block_engine_sender: broadcast::Sender<BlockEnginePackets>,
     num_threads: u64,
     disable_mempool: bool,
     exit: &Arc<AtomicBool>,
@@ -53,7 +61,7 @@ pub fn start_forward_and_delay_thread(
                     let mut forwarder_metrics = ForwarderMetrics::new(
                         buffered_packet_batches.capacity(),
                         verified_receiver.capacity().unwrap_or_default(), // TODO (LB): unbounded channel now, remove metric
-                        block_engine_sender.capacity(),
+                        BLOCK_ENGINE_FORWARDER_QUEUE_CAPACITY,
                     );
                     let mut last_metrics_upload = Instant::now();
 
@@ -64,7 +72,7 @@ pub fn start_forward_and_delay_thread(
                             forwarder_metrics = ForwarderMetrics::new(
                                 buffered_packet_batches.capacity(),
                                 verified_receiver.capacity().unwrap_or_default(), // TODO (LB): unbounded channel now, remove metric
-                                block_engine_sender.capacity(),
+                                BLOCK_ENGINE_FORWARDER_QUEUE_CAPACITY,
                             );
                             last_metrics_upload = Instant::now();
                         }
@@ -80,10 +88,11 @@ pub fn start_forward_and_delay_thread(
                                 forwarder_metrics.num_batches_received += 1;
                                 forwarder_metrics.num_packets_received += num_packets;
 
-                                // try_send because the block engine receiver only drains when it's connected
-                                // and we don't want to OOM on packet_receiver
+                                // A broadcast send never blocks and never reports Full: a full
+                                // ring evicts its oldest batch, and the handler counts the gap as
+                                // num_batches_dropped_oldest. The only error is "no receiver".
                                 if !disable_mempool && !block_engine_gone {
-                                    match block_engine_sender.try_send(BlockEnginePackets {
+                                    match block_engine_sender.send(BlockEnginePackets {
                                         banking_packet_batch: banking_packet_batch.clone(),
                                         stamp: system_time,
                                         expiration: packet_delay_ms,
@@ -92,22 +101,21 @@ pub fn start_forward_and_delay_thread(
                                             forwarder_metrics.num_be_packets_forwarded +=
                                                 num_packets;
                                         }
-                                        Err(TrySendError::Closed(_)) => {
+                                        Err(_) => {
                                             // The handler is gone: either no block engine was
                                             // configured (the receiver is dropped at startup,
                                             // since it is moved into a closure that never runs)
-                                            // or its thread has exited.
+                                            // or its thread has exited. A ring that is merely
+                                            // full does not land here -- it evicts instead.
                                             //
                                             // This used to panic, which took the whole relayer
                                             // down with it. That is backwards. Forwarding to the
                                             // fronted validator is the relayer's primary job and
                                             // it is unaffected; the block engine leg is
-                                            // auxiliary, and the code already treats an
-                                            // unavailable engine as survivable one arm up, where
-                                            // a full queue is merely counted. Killing the process
-                                            // turns "bundles are not flowing" into "the
-                                            // validator receives nothing at all", which is
-                                            // strictly worse for the operator we exist to serve.
+                                            // auxiliary. Killing the process turns "bundles are
+                                            // not flowing" into "the validator receives nothing
+                                            // at all", which is strictly worse for the operator
+                                            // we exist to serve.
                                             error!(
                                                 "block engine handler is gone; continuing to \
                                                  forward to validators without it"
@@ -116,11 +124,6 @@ pub fn start_forward_and_delay_thread(
                                             forwarder_metrics.num_be_packets_dropped +=
                                                 num_packets;
                                             forwarder_metrics.num_be_sender_closed += 1;
-                                        }
-                                        Err(TrySendError::Full(_)) => {
-                                            // block engine most likely not connected
-                                            forwarder_metrics.num_be_packets_dropped += num_packets;
-                                            forwarder_metrics.num_be_sender_full += 1;
                                         }
                                     }
                                 }
@@ -157,7 +160,7 @@ pub fn start_forward_and_delay_thread(
                             buffered_packet_batches.len(),
                             buffered_packet_batches.capacity(),
                             verified_receiver.len(),
-                            BLOCK_ENGINE_FORWARDER_QUEUE_CAPACITY - block_engine_sender.capacity(),
+                            block_engine_sender.len(),
                         );
                     }
                 })

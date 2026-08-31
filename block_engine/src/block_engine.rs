@@ -41,7 +41,8 @@ use thiserror::Error;
 use tokio::{
     runtime::Runtime,
     select,
-    sync::mpsc::{channel, Receiver, Sender},
+    sync::broadcast,
+    sync::mpsc::{channel, Sender},
     time::{interval, sleep},
 };
 use tokio_stream::wrappers::ReceiverStream;
@@ -82,6 +83,9 @@ impl Interceptor for AuthInterceptor {
     }
 }
 
+/// Cloneable because the relayer hands these out over a broadcast ring; `BankingPacketBatch`
+/// is `Arc`-backed, so the clone is a refcount bump.
+#[derive(Clone)]
 pub struct BlockEnginePackets {
     pub banking_packet_batch: BankingPacketBatch,
     pub stamp: SystemTime,
@@ -110,7 +114,7 @@ impl BlockEngineRelayerHandler {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         block_engine_config: Option<BlockEngineConfig>,
-        mut block_engine_receiver: Receiver<BlockEnginePackets>,
+        mut block_engine_receiver: broadcast::Receiver<BlockEnginePackets>,
         keypair: Arc<Keypair>,
         exit: Arc<AtomicBool>,
         aoi_cache_ttl_s: u64,
@@ -222,7 +226,7 @@ impl BlockEngineRelayerHandler {
     async fn auth_and_connect(
         block_engine_url: &str,
         auth_service_url: &str,
-        block_engine_receiver: &mut Receiver<BlockEnginePackets>,
+        block_engine_receiver: &mut broadcast::Receiver<BlockEnginePackets>,
         keypair: &Arc<Keypair>,
         exit: &Arc<AtomicBool>,
         aoi_cache_ttl_s: u64,
@@ -306,7 +310,7 @@ impl BlockEngineRelayerHandler {
     #[allow(clippy::too_many_arguments)]
     async fn start_event_loop(
         mut client: BlockEngineRelayerClient<InterceptedService<Channel, AuthInterceptor>>,
-        block_engine_receiver: &mut Receiver<BlockEnginePackets>,
+        block_engine_receiver: &mut broadcast::Receiver<BlockEnginePackets>,
         auth_client: AuthServiceClient<Channel>,
         keypair: &Arc<Keypair>,
         refresh_token: &mut Token,
@@ -360,7 +364,7 @@ impl BlockEngineRelayerHandler {
     #[allow(clippy::too_many_arguments)]
     async fn handle_packet_stream(
         block_engine_packet_sender: Sender<PacketBatchUpdate>,
-        block_engine_receiver: &mut Receiver<BlockEnginePackets>,
+        block_engine_receiver: &mut broadcast::Receiver<BlockEnginePackets>,
         subscribe_aoi_stream: Response<Streaming<AccountsOfInterestUpdate>>,
         subscribe_poi_stream: Response<Streaming<ProgramsOfInterestUpdate>>,
         packet_stream_response: Response<Streaming<StartExpiringPacketStreamResponse>>,
@@ -378,8 +382,15 @@ impl BlockEngineRelayerHandler {
         let mut poi_stream = subscribe_poi_stream.into_inner();
         let mut packet_response_stream = packet_stream_response.into_inner();
 
-        // drain old buffered packets before streaming packets to the block engine
-        while block_engine_receiver.try_recv().is_ok() {}
+        // Drain old buffered packets before streaming packets to the block engine. A ring that
+        // overflowed while we were disconnected reports Lagged rather than yielding a value, so
+        // stop on Empty/Closed instead of on the first error.
+        loop {
+            match block_engine_receiver.try_recv() {
+                Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
 
         is_connected_to_block_engine.store(true, Ordering::Relaxed);
 
@@ -458,8 +469,22 @@ impl BlockEngineRelayerHandler {
                 }
                 block_engine_batches = block_engine_receiver.recv() => {
                     trace!("received block engine batches");
-                    let block_engine_batches = block_engine_batches
-                        .ok_or_else(|| BlockEngineError::BlockEngineFailure("block engine packet receiver disconnected".to_string()))?;
+                    let block_engine_batches = match block_engine_batches {
+                        Ok(batches) => batches,
+                        // The ring evicted batches we had not read yet. That is the intended
+                        // behaviour under load -- mempool data the searchers see must be fresh,
+                        // and a batch that waited behind a full ring is not -- but it is only
+                        // acceptable if the rate is visible, so count it and keep going.
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            block_engine_stats.increment_num_batches_dropped_oldest(skipped);
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            return Err(BlockEngineError::BlockEngineFailure(
+                                "block engine packet receiver disconnected".to_string(),
+                            ))
+                        }
+                    };
 
                     let now = Instant::now();
 

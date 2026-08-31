@@ -49,7 +49,7 @@ use solana_keypair::read_keypair_file;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use tikv_jemallocator::Jemalloc;
-use tokio::{runtime::Builder, signal, sync::mpsc::channel};
+use tokio::{runtime::Builder, signal};
 use tonic::transport::Server;
 
 // no-op change to test ci
@@ -518,8 +518,9 @@ fn main() {
     // NOTE: make sure the channel here isn't too big because it will get backed up
     // with packets when the block engine isn't connected
     // tracked as forwarder_metrics.block_engine_sender_len
-    let (block_engine_sender, block_engine_receiver) =
-        channel(jito_transaction_relayer::forwarder::BLOCK_ENGINE_FORWARDER_QUEUE_CAPACITY);
+    let (block_engine_sender, block_engine_receiver) = tokio::sync::broadcast::channel(
+        jito_transaction_relayer::forwarder::BLOCK_ENGINE_FORWARDER_QUEUE_CAPACITY,
+    );
 
     let forward_and_delay_threads = start_forward_and_delay_thread(
         verified_receiver,

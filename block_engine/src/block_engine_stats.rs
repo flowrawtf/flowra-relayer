@@ -15,6 +15,12 @@ pub struct BlockEngineStats {
 
     num_packets_received: u64,
 
+    /// Batches the relayer wrote into the ring that this handler never read, because newer
+    /// batches overwrote them first. This is the block-engine leg's drop rate: non-zero means
+    /// the handler cannot keep up with the relayer's ingest and searchers are seeing a
+    /// subsampled mempool.
+    num_batches_dropped_oldest: u64,
+
     // Drops on the block-engine leg. Previously only the validator-facing leg counted these, so
     // a rule could be firing there and be silently undone here with nothing in the metrics.
     num_packets_dropped_ofac: u64,
@@ -74,6 +80,10 @@ impl BlockEngineStats {
         self.num_packets_received = self.num_packets_received.saturating_add(num)
     }
 
+    pub fn increment_num_batches_dropped_oldest(&mut self, num: u64) {
+        self.num_batches_dropped_oldest = self.num_batches_dropped_oldest.saturating_add(num)
+    }
+
     pub fn increment_packet_filter_elapsed_us(&mut self, num: u64) {
         self.packet_filter_elapsed_us = self.packet_filter_elapsed_us.saturating_add(num)
     }
@@ -131,6 +141,11 @@ impl BlockEngineStats {
             ("poi_update_elapsed_us", self.poi_update_elapsed_us, i64),
             ("poi_accounts_received", self.poi_accounts_received, i64),
             ("num_packets_received", self.num_packets_received, i64),
+            (
+                "num_batches_dropped_oldest",
+                self.num_batches_dropped_oldest,
+                i64
+            ),
             (
                 "num_packets_dropped_ofac",
                 self.num_packets_dropped_ofac,
