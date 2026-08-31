@@ -88,7 +88,7 @@ solana-streamer = { version = "=4.2.1", features = ["agave-unstable-api"] }
 thiserror = "1.0.40"
 tikv-jemallocator = { version = "0.6", features = ["profiling"] }
 tokio = { version = "1.29.1", features = ["full"] }
-tokio-stream = "0.1.12"
+tokio-stream = { version = "0.1.12", features = ["sync"] }
 tokio-util = "0.7"
 tonic = { version = "0.10.2", features = ["tls", "tls-roots", "tls-webpki-roots"] }
 tonic-build = "0.10.2"

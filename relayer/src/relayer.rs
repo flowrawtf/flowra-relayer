@@ -2,6 +2,7 @@ use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
     str::FromStr,
     net::IpAddr,
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, RwLock,
@@ -37,8 +38,11 @@ use solana_clock::Slot;
 use solana_pubkey::Pubkey;
 use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
-use tokio::sync::mpsc::{channel, error::TrySendError, Sender as TokioSender};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::broadcast;
+use tokio_stream::{
+    wrappers::{errors::BroadcastStreamRecvError, BroadcastStream},
+    Stream, StreamExt,
+};
 use tonic::{Request, Response, Status};
 
 use crate::{health_manager::HealthState, schedule_cache::LeaderScheduleUpdatingHandle};
@@ -58,6 +62,8 @@ struct RelayerMetrics {
     pub max_heartbeat_tick_latency_us: u64,
     pub metrics_latency_us: u64,
     pub num_try_send_channel_full: u64,
+    /// Ring entries (batches) evicted as stale by drop-oldest across all subscribers.
+    pub num_batches_dropped_oldest: u64,
     pub packet_latencies_us: Histogram,
 
     // Pre-forward filtering, counted per metrics interval. Every one of these is a packet the
@@ -116,6 +122,7 @@ impl RelayerMetrics {
             max_heartbeat_tick_latency_us: 0,
             metrics_latency_us: 0,
             num_try_send_channel_full: 0,
+            num_batches_dropped_oldest: 0,
             packet_latencies_us: Histogram::default(),
             num_packets_forwarded: 0,
             num_packets_dropped_ofac: 0,
@@ -161,16 +168,21 @@ impl RelayerMetrics {
 
     fn update_packet_subscription_total_capacity(
         &mut self,
-        packet_subscriptions: &HashMap<
-            Pubkey,
-            TokioSender<Result<SubscribePacketsResponse, Status>>,
-        >,
+        packet_subscriptions: &HashMap<Pubkey, ValidatorSubscription>,
     ) {
-        let packet_subscriptions_total_queued = packet_subscriptions
-            .values()
-            .map(|x| RelayerImpl::SUBSCRIBER_QUEUE_CAPACITY - x.capacity())
-            .sum::<usize>();
-        self.packet_subscriptions_total_queued = packet_subscriptions_total_queued;
+        let mut total_queued = 0usize;
+        for (pubkey, subscription) in packet_subscriptions {
+            total_queued += subscription.sender.len();
+            // Drop-oldest evictions are recorded by the subscriber's stream; collect them here
+            // so they land in the same report as everything else. Units on this path are
+            // BATCHES (ring entries), not packets.
+            let dropped = subscription.dropped_oldest.swap(0, Ordering::Relaxed);
+            if dropped > 0 {
+                self.num_batches_dropped_oldest += dropped;
+                self.increment_packets_dropped(pubkey, dropped);
+            }
+        }
+        self.packet_subscriptions_total_queued = total_queued;
     }
 
     /// Attribute a PBP drop to the rule that caused it. Which rule fired is the difference
@@ -228,6 +240,11 @@ impl RelayerMetrics {
             (
                 "num_try_send_channel_full",
                 self.num_try_send_channel_full,
+                i64
+            ),
+            (
+                "num_batches_dropped_oldest",
+                self.num_batches_dropped_oldest,
                 i64
             ),
             ("metrics_latency_us", self.metrics_latency_us, i64),
@@ -445,10 +462,24 @@ pub struct RelayerPacketBatches {
     pub banking_packet_batch: BankingPacketBatch,
 }
 
+/// One connected validator's packet stream.
+///
+/// The channel is a broadcast ring: when the subscriber falls behind, new sends overwrite the
+/// OLDEST queued batches instead of failing. On a latency-sensitive path that is the correct
+/// direction to shed load — a batch that has sat behind tens of thousands of others arrives
+/// seconds stale and can no longer make the block it was sent for, yet under the old bounded
+/// mpsc it was exactly the fresh batches that got dropped while the stale backlog kept its
+/// place (observed 45k-deep backlogs lining up with the worst leader windows).
+/// `dropped_oldest` is bumped by the receiving stream each time it detects a lag gap.
+pub struct ValidatorSubscription {
+    sender: broadcast::Sender<SubscribePacketsResponse>,
+    dropped_oldest: Arc<AtomicU64>,
+}
+
 pub enum Subscription {
     ValidatorPacketSubscription {
         pubkey: Pubkey,
-        sender: TokioSender<Result<SubscribePacketsResponse, Status>>,
+        subscription: ValidatorSubscription,
     },
 }
 
@@ -460,8 +491,7 @@ pub enum RelayerError {
 
 pub type RelayerResult<T> = Result<T, RelayerError>;
 
-type PacketSubscriptions =
-    Arc<RwLock<HashMap<Pubkey, TokioSender<Result<SubscribePacketsResponse, Status>>>>>;
+type PacketSubscriptions = Arc<RwLock<HashMap<Pubkey, ValidatorSubscription>>>;
 pub struct RelayerHandle {
     packet_subscriptions: PacketSubscriptions,
 }
@@ -518,7 +548,14 @@ pub type ValidatorPolicies = Arc<DashMap<Pubkey, StoredPolicy>>;
 pub const POLICY_TTL: Duration = Duration::from_secs(300);
 
 impl RelayerImpl {
-    pub const SUBSCRIBER_QUEUE_CAPACITY: usize = 50_000;
+    /// Ring capacity of each validator's packet stream, in batches (drop-oldest on overflow).
+    ///
+    /// Sized to bound *staleness*, not to avoid loss: at observed burst drain rates ~2k
+    /// batches is on the order of a slot or two in flight, so nothing older than that can
+    /// occupy the wire ahead of fresh packets. The previous 50k cap admitted ~11s of backlog
+    /// — every deeply-backlogged minute in the logs coincided with a cratered leader window.
+    /// (tokio's broadcast channel rounds capacity up to a power of two.)
+    pub const SUBSCRIBER_QUEUE_CAPACITY: usize = 2_048;
 
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -719,22 +756,19 @@ impl RelayerImpl {
             .read()
             .unwrap()
             .iter()
-            .filter_map(|(pubkey, sender)| {
-                // try send because it's a bounded channel and we don't want to block if the channel is full
-                match sender.try_send(Ok(SubscribePacketsResponse {
+            .filter_map(|(pubkey, subscription)| {
+                // A broadcast send only fails when the subscriber is gone; a full ring
+                // overwrites its oldest entry instead, so a packet backlog can no longer
+                // delay or drop a heartbeat.
+                match subscription.sender.send(SubscribePacketsResponse {
                     header: None,
                     msg: Some(subscribe_packets_response::Msg::Heartbeat(Heartbeat {
                         count: relayer_metrics.num_heartbeats,
                     })),
-                })) {
-                    Ok(_) => {}
-                    Err(TrySendError::Closed(_)) => return Some(*pubkey),
-                    Err(TrySendError::Full(_)) => {
-                        relayer_metrics.num_try_send_channel_full += 1;
-                        warn!("heartbeat channel is full for: {:?}", pubkey);
-                    }
+                }) {
+                    Ok(_) => None,
+                    Err(_) => Some(*pubkey),
                 }
-                None
             })
             .collect();
 
@@ -883,10 +917,9 @@ impl RelayerImpl {
         let l_subscriptions = subscriptions.read().unwrap();
 
         let senders = if forward_all {
-            l_subscriptions.iter().collect::<Vec<(
-                &Pubkey,
-                &TokioSender<Result<SubscribePacketsResponse, Status>>,
-            )>>()
+            l_subscriptions
+                .iter()
+                .collect::<Vec<(&Pubkey, &ValidatorSubscription)>>()
         } else {
             slot_leaders
                 .iter()
@@ -895,7 +928,7 @@ impl RelayerImpl {
         };
 
         let mut failed_forwards = Vec::new();
-        for (pubkey, sender) in &senders {
+        for (pubkey, subscription) in &senders {
             // A validator that filtered its own view gets that view; everyone else shares the
             // batch nobody's policy touched.
             let batches = filtered_batches.get(*pubkey).unwrap_or(&shared_batches);
@@ -906,23 +939,20 @@ impl RelayerImpl {
                     continue;
                 }
 
-                // try send because it's a bounded channel and we don't want to block if the channel is full
-                match sender.try_send(Ok(SubscribePacketsResponse {
+                // A broadcast send cannot block and cannot be Full: a full ring evicts its
+                // oldest batch (counted by the subscriber stream as dropped_oldest). The only
+                // failure is a departed subscriber.
+                match subscription.sender.send(SubscribePacketsResponse {
                     header: Some(Header {
                         ts: Some(Timestamp::from(SystemTime::now())),
                     }),
                     msg: Some(subscribe_packets_response::Msg::Batch(batch.clone())),
-                })) {
+                }) {
                     Ok(_) => {
                         relayer_metrics
                             .increment_packets_forwarded(pubkey, batch.packets.len() as u64);
                     }
-                    Err(TrySendError::Full(_)) => {
-                        error!("packet channel is full for pubkey: {:?}", pubkey);
-                        relayer_metrics
-                            .increment_packets_dropped(pubkey, batch.packets.len() as u64);
-                    }
-                    Err(TrySendError::Closed(_)) => {
+                    Err(_) => {
                         error!("channel is closed for pubkey: {:?}", pubkey);
                         failed_forwards.push(**pubkey);
                         break;
@@ -939,10 +969,13 @@ impl RelayerImpl {
         relayer_metrics: &mut RelayerMetrics,
     ) -> RelayerResult<()> {
         match maybe_subscription? {
-            Subscription::ValidatorPacketSubscription { pubkey, sender } => {
+            Subscription::ValidatorPacketSubscription {
+                pubkey,
+                subscription,
+            } => {
                 match subscriptions.write().unwrap().entry(pubkey) {
                     Entry::Vacant(entry) => {
-                        entry.insert(sender);
+                        entry.insert(subscription);
 
                         relayer_metrics.num_added_connections += 1;
                         datapoint_info!(
@@ -956,7 +989,7 @@ impl RelayerImpl {
                             ("pubkey", pubkey.to_string(), String)
                         );
                         error!("already connected, dropping old connection: {pubkey:?}");
-                        entry.insert(sender);
+                        entry.insert(subscription);
                     }
                 }
             }
@@ -1013,7 +1046,8 @@ impl Relayer for RelayerImpl {
         }));
     }
 
-    type SubscribePacketsStream = ReceiverStream<Result<SubscribePacketsResponse, Status>>;
+    type SubscribePacketsStream =
+        Pin<Box<dyn Stream<Item = Result<SubscribePacketsResponse, Status>> + Send>>;
 
     /// Validator calls this to subscribe to packets
     async fn subscribe_packets(
@@ -1027,14 +1061,27 @@ impl Relayer for RelayerImpl {
             .get()
             .ok_or_else(|| Status::internal("internal error fetching public key"))?;
 
-        let (sender, receiver) = channel(RelayerImpl::SUBSCRIBER_QUEUE_CAPACITY);
+        let (sender, receiver) = broadcast::channel(RelayerImpl::SUBSCRIBER_QUEUE_CAPACITY);
+        let dropped_oldest = Arc::new(AtomicU64::new(0));
         self.subscription_sender
             .send(Subscription::ValidatorPacketSubscription {
                 pubkey: *pubkey,
-                sender,
+                subscription: ValidatorSubscription {
+                    sender,
+                    dropped_oldest: dropped_oldest.clone(),
+                },
             })
             .map_err(|_| Status::internal("internal error adding subscription"))?;
-        Ok(Response::new(ReceiverStream::new(receiver)))
+        // A lag gap means the ring evicted that many stale batches while this stream was
+        // behind; record it and keep going — the next item is the oldest still-fresh one.
+        let stream = BroadcastStream::new(receiver).filter_map(move |item| match item {
+            Ok(response) => Some(Ok(response)),
+            Err(BroadcastStreamRecvError::Lagged(n)) => {
+                dropped_oldest.fetch_add(n, Ordering::Relaxed);
+                None
+            }
+        });
+        Ok(Response::new(Box::pin(stream)))
     }
 
     /// The validator pushes the policy the relayer must apply to that validator's own stream.
