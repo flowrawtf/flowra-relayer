@@ -11,7 +11,7 @@ use axum::{
     error_handling::HandleErrorLayer, http::StatusCode, routing::get, BoxError, Extension, Json,
     Router,
 };
-use jito_relayer::{health_manager::HealthState, relayer::RelayerHandle};
+use jito_relayer::{control::ControlClient, health_manager::HealthState, relayer::RelayerHandle};
 use log::debug;
 use serde::Serialize;
 use tower::{buffer::BufferLayer, limit::RateLimitLayer, ServiceBuilder};
@@ -21,6 +21,7 @@ pub struct RelayerState {
     slot_health: Arc<RwLock<HealthState>>,
     is_connected_to_block_engine: Arc<AtomicBool>,
     relayer_handle: RelayerHandle,
+    control: Option<Arc<ControlClient>>,
 }
 
 impl RelayerState {
@@ -28,11 +29,13 @@ impl RelayerState {
         slot_health: Arc<RwLock<HealthState>>,
         is_connected_to_block_engine: &Arc<AtomicBool>,
         relayer_handle: RelayerHandle,
+        control: Option<Arc<ControlClient>>,
     ) -> RelayerState {
         RelayerState {
             slot_health,
             is_connected_to_block_engine: is_connected_to_block_engine.clone(),
             relayer_handle,
+            control,
         }
     }
 }
@@ -42,6 +45,11 @@ pub struct RelayerStatus {
     slots_healthy: bool,
     is_connected_to_block_engine: bool,
     validators_connected: Vec<String>,
+    /// Control-plane snapshot in force (None = static/leader-schedule allowlist).
+    config_version: Option<u64>,
+    control_connected: Option<bool>,
+    control_origin: Option<String>,
+    allowed_validators: Option<usize>,
 }
 
 /// Returns an axum router with endpoints to get status of relayer
@@ -83,6 +91,10 @@ pub fn build_relayer_router(
                 .iter()
                 .map(|p| p.to_string())
                 .collect(),
+            config_version: state.control.as_ref().map(|c| c.version()),
+            control_connected: state.control.as_ref().map(|c| c.connected()),
+            control_origin: state.control.as_ref().map(|c| c.origin()),
+            allowed_validators: state.control.as_ref().map(|c| c.allowed().len()),
         };
         debug!("get_status: {:?}", status);
 

@@ -35,6 +35,12 @@ pub trait ValidatorAuther: Send + Sync + 'static {
     fn is_authorized(&self, pubkey: &Pubkey) -> bool;
 }
 
+impl<T: ValidatorAuther + ?Sized> ValidatorAuther for std::sync::Arc<T> {
+    fn is_authorized(&self, pubkey: &Pubkey) -> bool {
+        (**self).is_authorized(pubkey)
+    }
+}
+
 pub struct AuthServiceImpl<V: ValidatorAuther> {
     validator_auther: V,
 

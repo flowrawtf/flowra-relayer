@@ -45,7 +45,10 @@ use tokio_stream::{
 };
 use tonic::{Request, Response, Status};
 
-use crate::{health_manager::HealthState, schedule_cache::LeaderScheduleUpdatingHandle};
+use crate::{
+    auth_service::ValidatorAuther, health_manager::HealthState,
+    schedule_cache::LeaderScheduleUpdatingHandle,
+};
 
 #[derive(Default)]
 struct PacketForwardStats {
@@ -574,6 +577,7 @@ impl RelayerImpl {
         forward_all: bool,
         slot_lookahead: u64,
         heartbeat_tick_time: u64,
+        revocation: Option<Arc<dyn ValidatorAuther>>,
     ) -> Self {
         // receiver tracked as relayer_metrics.subscription_receiver_len
         let (subscription_sender, subscription_receiver) =
@@ -604,6 +608,7 @@ impl RelayerImpl {
                         validator_packet_batch_size,
                         forward_all,
                         heartbeat_tick_time,
+                        revocation,
                     );
                     warn!("RelayerImpl thread exited with result {res:?}")
                 })
@@ -643,6 +648,7 @@ impl RelayerImpl {
         validator_packet_batch_size: usize,
         forward_all: bool,
         heartbeat_tick_time: u64,
+        revocation: Option<Arc<dyn ValidatorAuther>>,
     ) -> RelayerResult<()> {
         let mut highest_slot = Slot::default();
 
@@ -692,6 +698,7 @@ impl RelayerImpl {
                             Self::handle_heartbeat(
                                 packet_subscriptions,
                                 &mut relayer_metrics,
+                                revocation.as_deref(),
                             )
                         },
                         HealthState::Unhealthy => packet_subscriptions.read().unwrap().keys().cloned().collect(),
@@ -748,15 +755,29 @@ impl RelayerImpl {
         }
     }
 
+    /// Besides the heartbeat, this is where a validator whose authorization was withdrawn
+    /// (control-plane registry change) loses its stream: it gets this heartbeat and the
+    /// stream closes — one tick of grace, no waiting for the access token to expire.
     fn handle_heartbeat(
         subscriptions: &PacketSubscriptions,
         relayer_metrics: &mut RelayerMetrics,
+        revocation: Option<&dyn ValidatorAuther>,
     ) -> Vec<Pubkey> {
         let failed_pubkey_updates = subscriptions
             .read()
             .unwrap()
             .iter()
             .filter_map(|(pubkey, subscription)| {
+                if let Some(auther) = revocation {
+                    if !auther.is_authorized(pubkey) {
+                        warn!("dropping validator {pubkey}: no longer authorized by the control plane");
+                        datapoint_info!(
+                            "relayer_revoked_subscription",
+                            ("pubkey", pubkey.to_string(), String)
+                        );
+                        return Some(*pubkey);
+                    }
+                }
                 // A broadcast send only fails when the subscriber is gone; a full ring
                 // overwrites its oldest entry instead, so a packet backlog can no longer
                 // delay or drop a heartbeat.

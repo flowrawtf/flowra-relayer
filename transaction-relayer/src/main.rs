@@ -31,6 +31,7 @@ use jito_protos::{
 use jito_relayer::{
     auth_interceptor::AuthInterceptor,
     auth_service::{AuthServiceImpl, ValidatorAuther},
+    control::ControlClient,
     health_manager::HealthManager,
     relayer::{RelayerImpl, ValidatorPolicies},
     schedule_cache::{LeaderScheduleCacheUpdater, LeaderScheduleUpdatingHandle},
@@ -151,8 +152,26 @@ struct Args {
 
     /// Validators allowed to authenticate and connect to the relayer, comma separated.
     /// If null then all validators on the leader schedule shall be permitted.
+    /// Ignored when --control-url is set.
     #[arg(long, env, value_delimiter = ',')]
     allowed_validators: Option<Vec<Pubkey>>,
+
+    /// flowra-control base URL (e.g. http://10.88.0.3:8081). When set, the validator
+    /// allowlist is the control plane's registry for this component, pushed live over SSE.
+    #[arg(long, env)]
+    control_url: Option<String>,
+
+    /// Bearer token for this component, as printed by `flowra-control component-create`.
+    #[arg(long, env, default_value = "")]
+    control_token: String,
+
+    /// This relayer's component id in flowra-control.
+    #[arg(long, env, default_value = "relayer")]
+    component_id: String,
+
+    /// Last applied snapshot, used at boot when the control plane is unreachable.
+    #[arg(long, env, default_value = "/var/lib/flowra/relayer-config.json")]
+    control_cache: PathBuf,
 
     /// The private key used to sign tokens by this server.
     #[arg(long, env)]
@@ -573,6 +592,30 @@ fn main() {
     );
 
     let server_addr = SocketAddr::new(args.grpc_bind_ip, args.grpc_bind_port);
+    let control = args.control_url.clone().map(|url| {
+        if args.control_token.is_empty() {
+            warn!("--control-url set with an empty --control-token; the control plane will refuse us");
+        }
+        if args.allowed_validators.is_some() {
+            warn!("--allowed-validators is ignored because --control-url is set");
+        }
+        ControlClient::start(
+            url,
+            args.control_token.clone(),
+            args.component_id.clone(),
+            Some(args.control_cache.clone()),
+            exit.clone(),
+        )
+    });
+    let validator_store = match (&control, args.allowed_validators) {
+        (Some(client), _) => ValidatorStore::ControlPlane(client.clone()),
+        (None, Some(pubkeys)) => ValidatorStore::UserDefined(HashSet::from_iter(pubkeys)),
+        (None, None) => ValidatorStore::LeaderSchedule(leader_cache.handle()),
+    };
+    let validator_auther: Arc<dyn ValidatorAuther> = Arc::new(ValidatorAutherImpl {
+        store: validator_store,
+    });
+
     let relayer_svc = RelayerImpl::new(
         downstream_slot_receiver,
         delay_packet_receiver,
@@ -589,6 +632,8 @@ fn main() {
         args.forward_all,
         args.slot_lookahead,
         args.heartbeat_tick_time,
+        // Live-stream revocation only makes sense for a list that changes at runtime.
+        control.as_ref().map(|_| validator_auther.clone()),
     );
 
     let priv_key = fs::read(&args.signing_key_pem_path).unwrap_or_else(|_| {
@@ -613,15 +658,12 @@ fn main() {
         key: PKey::public_key_from_pem(&key).unwrap(),
     });
 
-    let validator_store = match args.allowed_validators {
-        Some(pubkeys) => ValidatorStore::UserDefined(HashSet::from_iter(pubkeys)),
-        None => ValidatorStore::LeaderSchedule(leader_cache.handle()),
-    };
 
     let relayer_state = Arc::new(RelayerState::new(
         health_manager.handle(),
         &is_connected_to_block_engine,
         relayer_svc.handle(),
+        control.clone(),
     ));
 
     let rt = Builder::new_multi_thread().enable_all().build().unwrap();
@@ -637,9 +679,7 @@ fn main() {
 
     rt.block_on(async {
         let auth_svc = AuthServiceImpl::new(
-            ValidatorAutherImpl {
-                store: validator_store,
-            },
+            validator_auther.clone(),
             signing_key,
             verifying_key.clone(),
             Duration::from_secs(args.access_token_ttl_secs),
@@ -705,6 +745,7 @@ pub async fn shutdown_signal(exit: Arc<AtomicBool>) {
 enum ValidatorStore {
     LeaderSchedule(LeaderScheduleUpdatingHandle),
     UserDefined(HashSet<Pubkey>),
+    ControlPlane(Arc<ControlClient>),
 }
 
 struct ValidatorAutherImpl {
@@ -716,6 +757,7 @@ impl ValidatorAuther for ValidatorAutherImpl {
         match &self.store {
             ValidatorStore::LeaderSchedule(cache) => cache.is_scheduled_validator(pubkey),
             ValidatorStore::UserDefined(pubkeys) => pubkeys.contains(pubkey),
+            ValidatorStore::ControlPlane(client) => client.is_authorized(pubkey),
         }
     }
 }
