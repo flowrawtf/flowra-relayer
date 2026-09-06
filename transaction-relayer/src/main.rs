@@ -250,6 +250,12 @@ struct Args {
     #[arg(long, env, default_value_t = 4)]
     validator_packet_batch_size: usize,
 
+    /// How long (ms) a received packet is remembered so that repeat copies are dropped at
+    /// ingress instead of being forwarded. Matches the validator's own sigverify dedup at the
+    /// default; 0 forwards every copy.
+    #[arg(long, env, default_value_t = 2_000)]
+    packet_dedup_window_ms: u64,
+
     /// Disable Mempool forwarding
     #[arg(long, env, default_value_t = false)]
     disable_mempool: bool,
@@ -526,6 +532,8 @@ fn main() {
         args.max_unstaked_quic_connections,
         args.max_staked_quic_connections,
         staked_nodes_overrides.staked_map_id,
+        (args.packet_dedup_window_ms > 0)
+            .then(|| Duration::from_millis(args.packet_dedup_window_ms)),
     );
 
     let leader_cache = LeaderScheduleCacheUpdater::new(&rpc_load_balancer, &exit);

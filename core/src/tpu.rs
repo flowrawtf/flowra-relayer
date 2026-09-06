@@ -7,6 +7,7 @@ use std::{
     sync::{atomic::AtomicBool, Arc, RwLock},
     thread,
     thread::JoinHandle,
+    time::Duration,
 };
 
 use crossbeam_channel::Receiver;
@@ -80,6 +81,7 @@ impl Tpu {
         max_unstaked_connections: usize,
         max_staked_connections: usize,
         staked_nodes_overrides: HashMap<Pubkey, u64>,
+        dedup_window: Option<Duration>,
     ) -> (Self, Receiver<BankingPacketBatch>) {
         let TpuSockets {
             transactions_quic_sockets,
@@ -111,7 +113,7 @@ impl Tpu {
                 .name("relayer-quic-cancel".to_string())
                 .spawn(move || {
                     while !exit.load(std::sync::atomic::Ordering::Relaxed) {
-                        thread::sleep(std::time::Duration::from_millis(100));
+                        thread::sleep(Duration::from_millis(100));
                     }
                     cancel.cancel();
                 })
@@ -182,6 +184,7 @@ impl Tpu {
             tpu_receiver,
             banking_packet_sender,
             NonZeroUsize::new(SIGVERIFY_WORKERS).expect("non-zero"),
+            dedup_window,
             exit.clone(),
         );
 
