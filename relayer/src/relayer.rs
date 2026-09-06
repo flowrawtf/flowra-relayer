@@ -34,6 +34,7 @@ use prost_types::Timestamp;
 use agave_banking_stage_ingress_types::BankingPacketBatch;
 use solana_metrics::datapoint_info;
 use solana_message::AddressLookupTableAccount;
+use solana_perf::deduper::Deduper;
 use solana_clock::Slot;
 use solana_pubkey::Pubkey;
 use solana_transaction::versioned::VersionedTransaction;
@@ -92,6 +93,12 @@ struct RelayerMetrics {
     pub num_packets_dropped_deserialize: u64,
     /// Dropped converting to the protobuf packet (missing/oversized data).
     pub num_packets_dropped_proto_convert: u64,
+    /// A repeat of a packet already forwarded inside the dedup window. The validator would
+    /// have discarded it at its own ingress; the count is what the stream was spared.
+    pub num_packets_dropped_dedup: u64,
+    /// Dedup filter resets forced by fill level rather than age. Anything but zero means the
+    /// window is longer than the traffic can afford at this filter size.
+    pub num_deduper_saturations: u64,
 
     pub crossbeam_slot_receiver_processing_us: Histogram,
     pub crossbeam_delay_packet_receiver_processing_us: Histogram,
@@ -136,6 +143,8 @@ impl RelayerMetrics {
             num_validators_with_policy: 0,
             num_packets_dropped_deserialize: 0,
             num_packets_dropped_proto_convert: 0,
+            num_packets_dropped_dedup: 0,
+            num_deduper_saturations: 0,
             crossbeam_slot_receiver_processing_us: Histogram::default(),
             crossbeam_delay_packet_receiver_processing_us: Histogram::default(),
             crossbeam_subscription_receiver_processing_us: Histogram::default(),
@@ -283,6 +292,16 @@ impl RelayerMetrics {
             (
                 "num_packets_dropped_proto_convert",
                 self.num_packets_dropped_proto_convert,
+                i64
+            ),
+            (
+                "num_packets_dropped_dedup",
+                self.num_packets_dropped_dedup,
+                i64
+            ),
+            (
+                "num_deduper_saturations",
+                self.num_deduper_saturations,
                 i64
             ),
             (
@@ -560,6 +579,11 @@ impl RelayerImpl {
     /// (tokio's broadcast channel rounds capacity up to a power of two.)
     pub const SUBSCRIBER_QUEUE_CAPACITY: usize = 2_048;
 
+    /// Dedup filter sizing, matching agave's sigverify stage: ~8 MB of bits, two hashes, and a
+    /// reset once the filter is full enough to misfire on one packet in a thousand.
+    const DEDUPER_NUM_BITS: u64 = 63_999_979;
+    const DEDUPER_FALSE_POSITIVE_RATE: f64 = 0.001;
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         slot_receiver: Receiver<Slot>,
@@ -578,6 +602,7 @@ impl RelayerImpl {
         slot_lookahead: u64,
         heartbeat_tick_time: u64,
         revocation: Option<Arc<dyn ValidatorAuther>>,
+        dedup_window: Option<Duration>,
     ) -> Self {
         // receiver tracked as relayer_metrics.subscription_receiver_len
         let (subscription_sender, subscription_receiver) =
@@ -609,6 +634,7 @@ impl RelayerImpl {
                         forward_all,
                         heartbeat_tick_time,
                         revocation,
+                        dedup_window,
                     );
                     warn!("RelayerImpl thread exited with result {res:?}")
                 })
@@ -649,8 +675,13 @@ impl RelayerImpl {
         forward_all: bool,
         heartbeat_tick_time: u64,
         revocation: Option<Arc<dyn ValidatorAuther>>,
+        dedup_window: Option<Duration>,
     ) -> RelayerResult<()> {
         let mut highest_slot = Slot::default();
+
+        let mut rng = rand09::rng();
+        let deduper = dedup_window
+            .map(|window| (Deduper::<2, [u8]>::new(&mut rng, Self::DEDUPER_NUM_BITS), window));
 
         let heartbeat_tick = crossbeam_channel::tick(Duration::from_millis(heartbeat_tick_time));
         let metrics_tick = crossbeam_channel::tick(Duration::from_millis(1000));
@@ -677,7 +708,14 @@ impl RelayerImpl {
                 },
                 recv(delay_packet_receiver) -> maybe_packet_batches => {
                     let start = Instant::now();
-                    let failed_forwards = Self::forward_packets(maybe_packet_batches, packet_subscriptions, &slot_leaders, &mut relayer_metrics, &ofac_addresses, &validator_policies, &address_lookup_table_cache, validator_packet_batch_size, forward_all)?;
+                    if let Some((deduper, window)) = deduper.as_ref() {
+                        // Ages the filter out on the window, or early when it has filled up
+                        // enough that unrelated packets start colliding.
+                        if deduper.maybe_reset(&mut rng, Self::DEDUPER_FALSE_POSITIVE_RATE, *window) {
+                            relayer_metrics.num_deduper_saturations += 1;
+                        }
+                    }
+                    let failed_forwards = Self::forward_packets(maybe_packet_batches, packet_subscriptions, &slot_leaders, &mut relayer_metrics, &ofac_addresses, &validator_policies, &address_lookup_table_cache, validator_packet_batch_size, forward_all, deduper.as_ref().map(|(deduper, _)| deduper))?;
                     Self::drop_connections(failed_forwards, packet_subscriptions, &mut relayer_metrics);
                     let _ = relayer_metrics.crossbeam_delay_packet_receiver_processing_us.increment(start.elapsed().as_micros() as u64);
                 },
@@ -810,6 +848,14 @@ impl RelayerImpl {
     /// Each surviving packet is parsed exactly once into a `PacketSummary`; every validator's
     /// policy is then evaluated against that. Parsing per (packet x validator) would multiply the
     /// expensive step by the tenant count.
+    ///
+    /// Repeat copies are dropped here rather than at ingress, and only while there is somebody
+    /// to forward to. Senders spray each transaction many times over (per slot of fanout, per
+    /// retry, per RPC), and the fronted validator discards every copy but the first at its own
+    /// ingress anyway, so dropping them here only spares the stream. But a copy that arrived
+    /// before the validator's leader window went nowhere, and remembering it would make the
+    /// next copy -- the one that would have been delivered -- disappear too. Hence the deduper
+    /// sees a packet only once it is actually handed to a subscription.
     #[allow(clippy::too_many_arguments)]
     fn forward_packets(
         maybe_packet_batches: Result<RelayerPacketBatches, RecvError>,
@@ -821,6 +867,7 @@ impl RelayerImpl {
         address_lookup_table_cache: &Arc<DashMap<Pubkey, AddressLookupTableAccount>>,
         validator_packet_batch_size: usize,
         forward_all: bool,
+        deduper: Option<&Deduper<2, [u8]>>,
     ) -> RelayerResult<Vec<Pubkey>> {
         let packet_batches = maybe_packet_batches?;
 
@@ -853,13 +900,21 @@ impl RelayerImpl {
             .collect();
 
         // Pass one: recipient-independent drops.
-        let (mut n_ofac, mut n_deser, mut n_proto) = (0u64, 0u64, 0u64);
+        let (mut n_dedup, mut n_ofac, mut n_deser, mut n_proto) = (0u64, 0u64, 0u64, 0u64);
         // Summary is only built when some recipient can actually act on it.
         let need_summaries = !live_policies.is_empty();
+        // With nobody to forward to, nothing below is delivered, so nothing is remembered.
+        let deduper = deduper.filter(|_| !recipients.is_empty());
         let mut packets = Vec::new();
         let mut summaries: Vec<Option<PacketSummary>> = Vec::new();
         for batch in packet_batches.banking_packet_batch.iter() {
             for packet in batch.iter().filter(|p| !p.meta().discard()) {
+                if let Some(deduper) = deduper {
+                    if packet.data(..).is_some_and(|data| deduper.dedup(data)) {
+                        n_dedup += 1;
+                        continue;
+                    }
+                }
                 let mut summary = None;
                 if !ofac_addresses.is_empty() || need_summaries {
                     let tx: VersionedTransaction = match packet
@@ -890,6 +945,7 @@ impl RelayerImpl {
                 }
             }
         }
+        relayer_metrics.num_packets_dropped_dedup += n_dedup;
         relayer_metrics.num_packets_dropped_ofac += n_ofac;
         relayer_metrics.num_packets_dropped_deserialize += n_deser;
         relayer_metrics.num_packets_dropped_proto_convert += n_proto;
@@ -1299,5 +1355,171 @@ mod digest_tests {
             ..Default::default()
         };
         assert_eq!(policy_digest(&one), policy_digest(&two));
+    }
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::{atomic::AtomicU64, Arc, RwLock},
+        time::{Duration, Instant},
+    };
+
+    use agave_banking_stage_ingress_types::BankingPacketBatch;
+    use dashmap::DashMap;
+    use solana_perf::{
+        deduper::Deduper,
+        packet::{Packet, PacketBatch, RecycledPacketBatch},
+    };
+    use solana_pubkey::Pubkey;
+    use tokio::sync::broadcast;
+
+    use super::*;
+
+    /// One subscribed validator; returns its pubkey and the receiving end of its stream.
+    fn subscribed_validator() -> (
+        Pubkey,
+        PacketSubscriptions,
+        broadcast::Receiver<SubscribePacketsResponse>,
+    ) {
+        let pubkey = Pubkey::new_unique();
+        let (sender, receiver) = broadcast::channel(RelayerImpl::SUBSCRIBER_QUEUE_CAPACITY);
+        let subscriptions = Arc::new(RwLock::new(HashMap::from_iter([(
+            pubkey,
+            ValidatorSubscription {
+                sender,
+                dropped_oldest: Arc::new(AtomicU64::new(0)),
+            },
+        )])));
+        (pubkey, subscriptions, receiver)
+    }
+
+    fn batches_of(payloads: &[&[u8]]) -> RelayerPacketBatches {
+        let packets: Vec<Packet> = payloads
+            .iter()
+            .map(|payload| Packet::from_data(None, payload).expect("fits a packet"))
+            .collect();
+        RelayerPacketBatches {
+            stamp: Instant::now(),
+            banking_packet_batch: BankingPacketBatch::new(vec![PacketBatch::from(
+                RecycledPacketBatch::new(packets),
+            )]),
+        }
+    }
+
+    /// Runs one forward tick against `leaders` and returns how many packets were dropped as
+    /// repeats and how many were forwarded.
+    fn forward(
+        batches: RelayerPacketBatches,
+        subscriptions: &PacketSubscriptions,
+        leaders: &HashSet<Pubkey>,
+        deduper: &Deduper<2, [u8]>,
+    ) -> (u64, u64) {
+        let mut metrics = RelayerMetrics::new(1, 1, 1);
+        RelayerImpl::forward_packets(
+            Ok(batches),
+            subscriptions,
+            leaders,
+            &mut metrics,
+            &HashSet::new(),
+            &Arc::new(DashMap::new()),
+            &Arc::new(DashMap::new()),
+            64,
+            false,
+            Some(deduper),
+        )
+        .expect("forward");
+        (metrics.num_packets_dropped_dedup, metrics.num_packets_forwarded)
+    }
+
+    fn drain(receiver: &mut broadcast::Receiver<SubscribePacketsResponse>) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        while let Ok(response) = receiver.try_recv() {
+            if let Some(subscribe_packets_response::Msg::Batch(batch)) = response.msg {
+                out.extend(batch.packets.into_iter().map(|p| p.data));
+            }
+        }
+        out
+    }
+
+    fn payload(seed: u8) -> Vec<u8> {
+        bincode::serialize(&vec![seed; 32]).unwrap()
+    }
+
+    #[test]
+    fn a_copy_is_only_remembered_once_it_is_delivered() {
+        let (validator, subscriptions, mut receiver) = subscribed_validator();
+        let deduper = Deduper::<2, [u8]>::new(&mut rand09::rng(), 1 << 20);
+        let a = vec![1u8; 32];
+
+        // Nobody is leader yet: the copy goes nowhere and must not be remembered.
+        let (deduped, forwarded) =
+            forward(batches_of(&[&a]), &subscriptions, &HashSet::new(), &deduper);
+        assert_eq!((deduped, forwarded), (0, 1));
+        assert!(drain(&mut receiver).is_empty());
+
+        // Now the validator is in the window: the next copy is the one that gets delivered.
+        let leaders = HashSet::from_iter([validator]);
+        let (deduped, forwarded) = forward(batches_of(&[&a]), &subscriptions, &leaders, &deduper);
+        assert_eq!((deduped, forwarded), (0, 1));
+        assert_eq!(drain(&mut receiver), vec![payload(1)]);
+
+        // Delivered once; every further copy inside the window is a repeat.
+        let (deduped, forwarded) =
+            forward(batches_of(&[&a, &a]), &subscriptions, &leaders, &deduper);
+        assert_eq!((deduped, forwarded), (2, 0));
+        assert!(drain(&mut receiver).is_empty());
+    }
+
+    #[test]
+    fn distinct_packets_in_one_tick_all_go_through() {
+        let (validator, subscriptions, mut receiver) = subscribed_validator();
+        let deduper = Deduper::<2, [u8]>::new(&mut rand09::rng(), 1 << 20);
+        let leaders = HashSet::from_iter([validator]);
+        let (a, b) = (vec![1u8; 32], vec![2u8; 32]);
+
+        let (deduped, forwarded) =
+            forward(batches_of(&[&a, &b, &a]), &subscriptions, &leaders, &deduper);
+        assert_eq!((deduped, forwarded), (1, 2));
+        assert_eq!(drain(&mut receiver), vec![payload(1), payload(2)]);
+    }
+
+    #[test]
+    fn dedup_off_forwards_every_copy() {
+        let (validator, subscriptions, mut receiver) = subscribed_validator();
+        let leaders = HashSet::from_iter([validator]);
+        let a = vec![1u8; 32];
+        let mut metrics = RelayerMetrics::new(1, 1, 1);
+        RelayerImpl::forward_packets(
+            Ok(batches_of(&[&a, &a])),
+            &subscriptions,
+            &leaders,
+            &mut metrics,
+            &HashSet::new(),
+            &Arc::new(DashMap::new()),
+            &Arc::new(DashMap::new()),
+            64,
+            false,
+            None,
+        )
+        .expect("forward");
+        assert_eq!(metrics.num_packets_forwarded, 2);
+        assert_eq!(drain(&mut receiver).len(), 2);
+    }
+
+    #[test]
+    fn the_window_forgets() {
+        let (validator, subscriptions, _receiver) = subscribed_validator();
+        let mut rng = rand09::rng();
+        let deduper = Deduper::<2, [u8]>::new(&mut rng, 1 << 20);
+        let leaders = HashSet::from_iter([validator]);
+        let a = vec![1u8; 32];
+
+        forward(batches_of(&[&a]), &subscriptions, &leaders, &deduper);
+        assert_eq!(forward(batches_of(&[&a]), &subscriptions, &leaders, &deduper).0, 1);
+        std::thread::sleep(Duration::from_millis(20));
+        deduper.maybe_reset(&mut rng, 0.001, Duration::from_millis(10));
+        assert_eq!(forward(batches_of(&[&a]), &subscriptions, &leaders, &deduper).0, 0);
     }
 }

@@ -250,8 +250,8 @@ struct Args {
     #[arg(long, env, default_value_t = 4)]
     validator_packet_batch_size: usize,
 
-    /// How long (ms) a received packet is remembered so that repeat copies are dropped at
-    /// ingress instead of being forwarded. Matches the validator's own sigverify dedup at the
+    /// How long (ms) a packet forwarded to a validator is remembered so that repeat copies are
+    /// dropped instead of forwarded again. Matches the validator's own sigverify dedup at the
     /// default; 0 forwards every copy.
     #[arg(long, env, default_value_t = 2_000)]
     packet_dedup_window_ms: u64,
@@ -532,8 +532,6 @@ fn main() {
         args.max_unstaked_quic_connections,
         args.max_staked_quic_connections,
         staked_nodes_overrides.staked_map_id,
-        (args.packet_dedup_window_ms > 0)
-            .then(|| Duration::from_millis(args.packet_dedup_window_ms)),
     );
 
     let leader_cache = LeaderScheduleCacheUpdater::new(&rpc_load_balancer, &exit);
@@ -642,6 +640,8 @@ fn main() {
         args.heartbeat_tick_time,
         // Live-stream revocation only makes sense for a list that changes at runtime.
         control.as_ref().map(|_| validator_auther.clone()),
+        (args.packet_dedup_window_ms > 0)
+            .then(|| Duration::from_millis(args.packet_dedup_window_ms)),
     );
 
     let priv_key = fs::read(&args.signing_key_pem_path).unwrap_or_else(|_| {

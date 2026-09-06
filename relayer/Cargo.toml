@@ -28,6 +28,8 @@ log = { workspace = true }
 openssl = { workspace = true }
 prost-types = { workspace = true }
 rand = { workspace = true }
+# solana-perf's deduper takes a rand 0.9 Rng; the workspace is still on 0.8 elsewhere.
+rand09 = { package = "rand", version = "0.9" }
 serde = { workspace = true }
 sha2 = { workspace = true }
 solana-client = { workspace = true }
