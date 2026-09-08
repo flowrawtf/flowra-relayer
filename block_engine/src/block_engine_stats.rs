@@ -25,6 +25,12 @@ pub struct BlockEngineStats {
     // a rule could be firing there and be silently undone here with nothing in the metrics.
     num_packets_dropped_ofac: u64,
 
+    /// Packets dropped because the block-engine send queue was full at the moment of
+    /// forwarding. This replaced a blocking `send_timeout`, which stalled the whole loop ~1s
+    /// per batch while the ring behind it evicted tens of thousands of batches (2026-09-08,
+    /// every forb5u leader window). A full queue now costs one batch, visibly.
+    num_packets_dropped_queue_full: u64,
+
     packet_filter_elapsed_us: u64,
     packet_forward_elapsed_us: u64,
 
@@ -125,6 +131,11 @@ impl BlockEngineStats {
         self.num_packets_dropped_ofac = self.num_packets_dropped_ofac.saturating_add(num)
     }
 
+    pub fn increment_num_packets_dropped_queue_full(&mut self, num: u64) {
+        self.num_packets_dropped_queue_full =
+            self.num_packets_dropped_queue_full.saturating_add(num)
+    }
+
     pub fn increment_flush_elapsed_us(&mut self, num: u64) {
         self.flush_elapsed_us = self.flush_elapsed_us.saturating_add(num)
     }
@@ -149,6 +160,11 @@ impl BlockEngineStats {
             (
                 "num_packets_dropped_ofac",
                 self.num_packets_dropped_ofac,
+                i64
+            ),
+            (
+                "num_packets_dropped_queue_full",
+                self.num_packets_dropped_queue_full,
                 i64
             ),
             (

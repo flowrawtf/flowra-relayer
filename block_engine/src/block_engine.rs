@@ -42,7 +42,7 @@ use tokio::{
     runtime::Runtime,
     select,
     sync::broadcast,
-    sync::mpsc::{channel, Sender},
+    sync::mpsc::{channel, error::TrySendError, Sender},
     time::{interval, sleep},
 };
 use tokio_stream::wrappers::ReceiverStream;
@@ -109,7 +109,16 @@ pub struct BlockEngineRelayerHandler {
 }
 
 impl BlockEngineRelayerHandler {
-    const BLOCK_ENGINE_PACKET_QUEUE_CAPACITY: usize = 1_000;
+    // Bounded so a slow engine cannot turn this queue into seconds of stale mempool: with
+    // coalesced batches (below) the leg carries ≤ ~200 batches/s, so 200 ≈ 1s of backlog.
+    // Was 1_000 with a blocking send — see `forward_packets`.
+    const BLOCK_ENGINE_PACKET_QUEUE_CAPACITY: usize = 200;
+    /// Coalesce ring batches (≈2 packets each off the relayer) before the block-engine send:
+    /// on a cross-region leg the per-batch cost (gRPC framing plus the engine's per-batch
+    /// work) dominated, and 2–4k batches/s during a leader window pinned the queue at
+    /// capacity. Flush at this many packets or after BE_COALESCE_MAX_WAIT, whichever first.
+    const BE_COALESCE_MAX_PACKETS: usize = 64;
+    const BE_COALESCE_MAX_WAIT: Duration = Duration::from_millis(5);
 
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -409,6 +418,9 @@ impl BlockEngineRelayerHandler {
         let mut heartbeat_interval = interval(Duration::from_millis(500));
         let mut auth_refresh_interval = interval(Duration::from_secs(60));
         let mut metrics_interval = interval(Duration::from_secs(1));
+        // Bounds how long a coalesced batch waits for company before it is sent.
+        let mut coalesce_tick = interval(Self::BE_COALESCE_MAX_WAIT);
+        let mut pending: Option<ExpiringPacketBatch> = None;
 
         let mut heartbeat_count = 0;
         // Liveness watchdog: the engine replies to each of our heartbeats (2/s), so a
@@ -496,9 +508,45 @@ impl BlockEngineRelayerHandler {
                     block_engine_stats.increment_packet_filter_elapsed_us(now.elapsed().as_micros() as u64);
 
                     if let Some(filtered_packets) = filtered_packets {
+                        // Merge into the pending coalesced batch; send when it reaches
+                        // BE_COALESCE_MAX_PACKETS, otherwise the tick arm below sends it.
+                        let expiry_ms = filtered_packets.expiry_ms;
+                        let src = filtered_packets.batch;
+                        match pending.as_mut() {
+                            None => {
+                                pending = Some(ExpiringPacketBatch {
+                                    header: filtered_packets.header,
+                                    batch: src,
+                                    expiry_ms,
+                                });
+                            }
+                            Some(p) => {
+                                if let (Some(dst), Some(src)) = (p.batch.as_mut(), src) {
+                                    dst.packets.extend(src.packets);
+                                }
+                                p.expiry_ms = p.expiry_ms.min(expiry_ms);
+                            }
+                        }
+                        let full = pending
+                            .as_ref()
+                            .and_then(|p| p.batch.as_ref())
+                            .map(|b| b.packets.len() >= Self::BE_COALESCE_MAX_PACKETS)
+                            .unwrap_or(false);
+                        if full {
+                            if let Some(p) = pending.take() {
+                                let now = Instant::now();
+                                let n = Self::forward_packets(&block_engine_packet_sender, p, &mut block_engine_stats)?;
+                                block_engine_stats.increment_packet_forward_count(n as u64);
+                                block_engine_stats.increment_packet_forward_elapsed_us(now.elapsed().as_micros() as u64);
+                            }
+                        }
+                    }
+                }
+                _ = coalesce_tick.tick() => {
+                    if let Some(p) = pending.take() {
                         let now = Instant::now();
-                        let packet_forward_count = Self::forward_packets(&block_engine_packet_sender, filtered_packets).await?;
-                        block_engine_stats.increment_packet_forward_count(packet_forward_count as u64);
+                        let n = Self::forward_packets(&block_engine_packet_sender, p, &mut block_engine_stats)?;
+                        block_engine_stats.increment_packet_forward_count(n as u64);
                         block_engine_stats.increment_packet_forward_elapsed_us(now.elapsed().as_micros() as u64);
                     }
                 }
@@ -684,31 +732,34 @@ impl BlockEngineRelayerHandler {
         }
     }
 
-    /// Forwards packets to the Block Engine
-    async fn forward_packets(
+    /// Forwards a (coalesced) batch to the Block Engine without ever blocking this loop.
+    ///
+    /// This used to be `send_timeout(3s)`. When the gRPC sender was not draining (engine
+    /// back-pressuring the stream), that blocked here for ~1s per batch, and while it
+    /// blocked the ring feeding this loop evicted tens of thousands of batches — every
+    /// forb5u leader window on 2026-09-08. A full queue now costs exactly this batch,
+    /// counted in `num_packets_dropped_queue_full`, and the loop keeps its freshness. A
+    /// closed sender still errors out so the outer loop reconnects.
+    fn forward_packets(
         block_engine_packet_sender: &Sender<PacketBatchUpdate>,
         batch: ExpiringPacketBatch,
+        stats: &mut BlockEngineStats,
     ) -> BlockEngineResult<usize> {
-        let num_packets = batch.batch.as_ref().unwrap().packets.len();
-
-        // send_timeout instead of send: if the gRPC sender stops draining (engine not
-        // reading), a plain send().await would block this loop forever with no error
-        // and no reconnect. Timing out turns a stalled link into a clean reconnect.
-        if let Err(e) = block_engine_packet_sender
-            .send_timeout(
-                PacketBatchUpdate {
-                    msg: Some(Msg::Batches(batch)),
-                },
-                Duration::from_secs(3),
-            )
-            .await
-        {
-            error!("error forwarding packets {}", e);
-            Err(BlockEngineError::BlockEngineFailure(
-                "error forwarding packets".to_string(),
-            ))
-        } else {
-            Ok(num_packets)
+        let num_packets = batch.batch.as_ref().map(|b| b.packets.len()).unwrap_or(0);
+        match block_engine_packet_sender.try_send(PacketBatchUpdate {
+            msg: Some(Msg::Batches(batch)),
+        }) {
+            Ok(()) => Ok(num_packets),
+            Err(TrySendError::Full(_)) => {
+                stats.increment_num_packets_dropped_queue_full(num_packets as u64);
+                Ok(0)
+            }
+            Err(TrySendError::Closed(_)) => {
+                error!("error forwarding packets: block engine sender closed");
+                Err(BlockEngineError::BlockEngineFailure(
+                    "error forwarding packets".to_string(),
+                ))
+            }
         }
     }
 
