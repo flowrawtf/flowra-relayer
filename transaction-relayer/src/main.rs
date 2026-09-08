@@ -584,6 +584,8 @@ fn main() {
         address_lookup_table_cache.clone(),
         &is_connected_to_block_engine,
         ofac_addresses.clone(),
+        (args.packet_dedup_window_ms > 0)
+            .then(|| Duration::from_millis(args.packet_dedup_window_ms)),
     );
 
     // receiver tracked as relayer_metrics.slot_receiver_len

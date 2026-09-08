@@ -32,6 +32,7 @@ use log::{error, *};
 use prost_types::Timestamp;
 use agave_banking_stage_ingress_types::BankingPacketBatch;
 use solana_metrics::{datapoint_error, datapoint_info};
+use solana_perf::deduper::Deduper;
 use solana_message::AddressLookupTableAccount;
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
@@ -119,6 +120,13 @@ impl BlockEngineRelayerHandler {
     /// capacity. Flush at this many packets or after BE_COALESCE_MAX_WAIT, whichever first.
     const BE_COALESCE_MAX_PACKETS: usize = 64;
     const BE_COALESCE_MAX_WAIT: Duration = Duration::from_millis(5);
+    /// Dedup filter for this leg, sized like the validator leg's (`relayer::RelayerImpl`).
+    /// Measured 2026-09-08 14:18 (forb5u window): of 224k packets the engine received in
+    /// 30s, 105k were repeats of ~8k signatures, and the engine's ingest worker — which
+    /// parses every packet before it can tell — fell 250–500ms behind. The validator leg
+    /// already drops repeats; this leg forwarded every copy.
+    const DEDUPER_NUM_BITS: u64 = 63_999_979;
+    const DEDUPER_FALSE_POSITIVE_RATE: f64 = 0.001;
 
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -130,6 +138,7 @@ impl BlockEngineRelayerHandler {
         address_lookup_table_cache: Arc<DashMap<Pubkey, AddressLookupTableAccount>>,
         is_connected_to_block_engine: &Arc<AtomicBool>,
         ofac_addresses: HashSet<Pubkey>,
+        dedup_window: Option<Duration>,
     ) -> BlockEngineRelayerHandler {
         let is_connected_to_block_engine = is_connected_to_block_engine.clone();
         let block_engine_forwarder = block_engine_config.map(|config| {
@@ -149,6 +158,7 @@ impl BlockEngineRelayerHandler {
                                 &address_lookup_table_cache,
                                 &is_connected_to_block_engine,
                                 &ofac_addresses,
+                                dedup_window,
                             )
                             .await;
                             is_connected_to_block_engine.store(false, Ordering::Relaxed);
@@ -242,6 +252,7 @@ impl BlockEngineRelayerHandler {
         address_lookup_table_cache: &Arc<DashMap<Pubkey, AddressLookupTableAccount>>,
         is_connected_to_block_engine: &Arc<AtomicBool>,
         ofac_addresses: &HashSet<Pubkey>,
+        dedup_window: Option<Duration>,
     ) -> BlockEngineResult<()> {
         let mut auth_endpoint = Endpoint::from_str(auth_service_url).expect("valid auth url");
         if auth_service_url.contains("https") {
@@ -307,6 +318,7 @@ impl BlockEngineRelayerHandler {
             address_lookup_table_cache,
             is_connected_to_block_engine,
             ofac_addresses,
+            dedup_window,
         )
         .await
     }
@@ -329,6 +341,7 @@ impl BlockEngineRelayerHandler {
         address_lookup_table_cache: &Arc<DashMap<Pubkey, AddressLookupTableAccount>>,
         is_connected_to_block_engine: &Arc<AtomicBool>,
         ofac_addresses: &HashSet<Pubkey>,
+        dedup_window: Option<Duration>,
     ) -> BlockEngineResult<()> {
         let subscribe_aoi_stream = client
             .subscribe_accounts_of_interest(AccountsOfInterestRequest {})
@@ -366,6 +379,7 @@ impl BlockEngineRelayerHandler {
             address_lookup_table_cache,
             is_connected_to_block_engine,
             ofac_addresses,
+            dedup_window,
         )
         .await
     }
@@ -386,6 +400,7 @@ impl BlockEngineRelayerHandler {
         address_lookup_table_cache: &Arc<DashMap<Pubkey, AddressLookupTableAccount>>,
         is_connected_to_block_engine: &Arc<AtomicBool>,
         ofac_addresses: &HashSet<Pubkey>,
+        dedup_window: Option<Duration>,
     ) -> BlockEngineResult<()> {
         let mut aoi_stream = subscribe_aoi_stream.into_inner();
         let mut poi_stream = subscribe_poi_stream.into_inner();
@@ -414,6 +429,12 @@ impl BlockEngineRelayerHandler {
         let mut forward_all = false;
 
         let mut block_engine_stats = BlockEngineStats::default();
+
+        // Own instance, not the validator leg's: that one only remembers packets it actually
+        // delivered (see `relayer::forward_packets`), while this leg forwards everything.
+        let mut rng = rand09::rng();
+        let deduper = dedup_window
+            .map(|window| (Deduper::<2, [u8]>::new(&mut rng, Self::DEDUPER_NUM_BITS), window));
 
         let mut heartbeat_interval = interval(Duration::from_millis(500));
         let mut auth_refresh_interval = interval(Duration::from_secs(60));
@@ -504,7 +525,12 @@ impl BlockEngineRelayerHandler {
                     let num_packets: u64 = block_engine_batches.banking_packet_batch.iter().map(|b|b.len() as u64).sum::<u64>();
                     block_engine_stats.increment_num_packets_received(num_packets);
 
-                    let filtered_packets = Self::filter_packets(block_engine_batches, num_packets, &mut accounts_of_interest, &mut programs_of_interest, address_lookup_table_cache, ofac_addresses, forward_all, &mut block_engine_stats);
+                    if let Some((deduper, window)) = deduper.as_ref() {
+                        if deduper.maybe_reset(&mut rng, Self::DEDUPER_FALSE_POSITIVE_RATE, *window) {
+                            block_engine_stats.increment_num_deduper_saturations(1);
+                        }
+                    }
+                    let filtered_packets = Self::filter_packets(block_engine_batches, num_packets, &mut accounts_of_interest, &mut programs_of_interest, address_lookup_table_cache, ofac_addresses, forward_all, deduper.as_ref().map(|(d, _)| d), &mut block_engine_stats);
                     block_engine_stats.increment_packet_filter_elapsed_us(now.elapsed().as_micros() as u64);
 
                     if let Some(filtered_packets) = filtered_packets {
@@ -774,6 +800,7 @@ impl BlockEngineRelayerHandler {
         address_lookup_table_cache: &DashMap<Pubkey, AddressLookupTableAccount>,
         ofac_addresses: &HashSet<Pubkey>,
         forward_all: bool,
+        deduper: Option<&Deduper<2, [u8]>>,
         block_engine_stats: &mut BlockEngineStats,
     ) -> Option<ExpiringPacketBatch> {
         let mut filtered_packets = Vec::with_capacity(num_packets as usize);
@@ -782,6 +809,13 @@ impl BlockEngineRelayerHandler {
             for packet in batch {
                 if packet.meta().discard() {
                     continue;
+                }
+                // Before the deserialize: a repeat costs one hash, not a parse.
+                if let Some(deduper) = deduper {
+                    if packet.data(..).is_some_and(|data| deduper.dedup(data)) {
+                        block_engine_stats.increment_num_packets_dropped_dedup(1);
+                        continue;
+                    }
                 }
 
                 if let Some(Ok(tx)) = packet

@@ -31,6 +31,11 @@ pub struct BlockEngineStats {
     /// every forb5u leader window). A full queue now costs one batch, visibly.
     num_packets_dropped_queue_full: u64,
 
+    /// Repeats of a packet already sent to the block engine inside the dedup window, and how
+    /// often that filter was reset early because it filled up (see `DEDUPER_*`).
+    num_packets_dropped_dedup: u64,
+    num_deduper_saturations: u64,
+
     packet_filter_elapsed_us: u64,
     packet_forward_elapsed_us: u64,
 
@@ -136,6 +141,14 @@ impl BlockEngineStats {
             self.num_packets_dropped_queue_full.saturating_add(num)
     }
 
+    pub fn increment_num_packets_dropped_dedup(&mut self, num: u64) {
+        self.num_packets_dropped_dedup = self.num_packets_dropped_dedup.saturating_add(num)
+    }
+
+    pub fn increment_num_deduper_saturations(&mut self, num: u64) {
+        self.num_deduper_saturations = self.num_deduper_saturations.saturating_add(num)
+    }
+
     pub fn increment_flush_elapsed_us(&mut self, num: u64) {
         self.flush_elapsed_us = self.flush_elapsed_us.saturating_add(num)
     }
@@ -165,6 +178,16 @@ impl BlockEngineStats {
             (
                 "num_packets_dropped_queue_full",
                 self.num_packets_dropped_queue_full,
+                i64
+            ),
+            (
+                "num_packets_dropped_dedup",
+                self.num_packets_dropped_dedup,
+                i64
+            ),
+            (
+                "num_deduper_saturations",
+                self.num_deduper_saturations,
                 i64
             ),
             (
