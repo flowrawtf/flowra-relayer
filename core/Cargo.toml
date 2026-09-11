@@ -37,6 +37,7 @@ solana-packet = { workspace = true }
 solana-pubkey = { workspace = true }
 solana-signer = { workspace = true }
 solana-transaction = { workspace = true }
+wincode = { workspace = true }
 solana-transaction-error = { workspace = true }
 solana-streamer = { workspace = true }
 thiserror = { workspace = true }

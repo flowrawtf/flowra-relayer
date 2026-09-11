@@ -17,6 +17,7 @@ pub mod pbp;
 mod sigverify_stage;
 mod staked_nodes_updater_service;
 pub mod tpu;
+pub mod tx_decode;
 
 /// Returns an exit boolean to let other threads gracefully shut down
 pub fn graceful_panic(callback: Option<fn(&PanicHookInfo)>) -> Arc<AtomicBool> {

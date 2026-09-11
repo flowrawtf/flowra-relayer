@@ -818,9 +818,9 @@ impl BlockEngineRelayerHandler {
                     }
                 }
 
-                if let Some(Ok(tx)) = packet
+                if let Some(tx) = packet
                     .data(..)
-                    .map(bincode::deserialize::<VersionedTransaction>)
+                    .and_then(jito_core::tx_decode::deserialize_transaction)
                 {
                     // Drops come first, and they are unconditional. This leg and the validator-
                     // facing leg in `relayer::forward_packets` are two copies of the same

@@ -919,8 +919,8 @@ impl RelayerImpl {
                 if !ofac_addresses.is_empty() || need_summaries {
                     let tx: VersionedTransaction = match packet
                         .data(..)
+                        .and_then(jito_core::tx_decode::deserialize_transaction)
                         .ok_or(())
-                        .and_then(|data| bincode::deserialize(data).map_err(|_| ()))
                     {
                         Ok(tx) => tx,
                         Err(_) => {

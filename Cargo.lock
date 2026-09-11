@@ -3890,6 +3890,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic 0.10.2",
+ "wincode",
 ]
 
 [[package]]
@@ -3931,6 +3932,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util 0.7.19",
+ "wincode",
 ]
 
 [[package]]
@@ -3987,6 +3989,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic 0.10.2",
+ "wincode",
 ]
 
 [[package]]

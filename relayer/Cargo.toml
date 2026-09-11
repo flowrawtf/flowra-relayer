@@ -43,6 +43,7 @@ solana-sha256-hasher = { workspace = true }
 solana-clock = { workspace = true }
 solana-pubkey = { workspace = true }
 solana-transaction = { workspace = true }
+wincode = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

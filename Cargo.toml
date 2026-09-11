@@ -84,8 +84,10 @@ solana-pubkey = "4"
 solana-sha256-hasher = "3"
 solana-signature = "3"
 solana-signer = "3"
-solana-transaction = { version = "4.1", features = ["serde"] }
+solana-transaction = { version = "4.1", features = ["serde", "wincode"] }
 solana-transaction-error = "3"
+# Packet codec used by the runtime; the only one that reads transaction v1 (SIMD-0385).
+wincode = "0.5"
 solana-streamer = { version = "=4.2.1", features = ["agave-unstable-api"] }
 thiserror = "1.0.40"
 tikv-jemallocator = { version = "0.6", features = ["profiling"] }
