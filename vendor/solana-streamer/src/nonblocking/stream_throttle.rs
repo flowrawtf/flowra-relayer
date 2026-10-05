@@ -183,9 +183,13 @@ impl StakedStreamLoadEMA {
                 if self.staked_throttling_enabled.load(Ordering::Relaxed) {
                     // 1 is added to `max_unstaked_load_in_throttling_window` to guarantee that staked
                     // clients get at least 1 more number of streams than unstaked connections.
-                    self.max_staked_load_in_throttling_window
-                        .saturating_mul(stake)
-                        .checked_div(total_stake)
+                    // In u128: `load * stake` overflows u64 for any peer above ~28.8k SOL at
+                    // 8000 streams/ms, and a saturated product divided by total stake left the
+                    // largest peers with the unstaked floor. Upstream agave #14799.
+                    u128::from(self.max_staked_load_in_throttling_window)
+                        .saturating_mul(u128::from(stake))
+                        .checked_div(u128::from(total_stake))
+                        .and_then(|capacity| u64::try_from(capacity).ok())
                         .unwrap_or(self.max_unstaked_load_in_throttling_window + 1)
                         .max(self.max_unstaked_load_in_throttling_window + 1)
                 } else {
@@ -300,7 +304,9 @@ pub mod test {
                 ConnectionPeerType::Unstaked,
                 10000,
             ),
-            20
+            // MAX_UNSTAKED_TPS over one throttling window; this was 20 before the relayer
+            // raised the unstaked allowance.
+            MAX_UNSTAKED_TPS * STREAM_THROTTLING_INTERVAL_MS / 1000
         );
     }
 
@@ -354,6 +360,32 @@ pub mod test {
                 100
             ),
             50
+        );
+    }
+
+    #[test]
+    fn test_large_stake_keeps_its_share_at_relayer_budget() {
+        // The relayer runs at 8000 streams/ms: 6400 staked per ms, 640_000 per 100ms window.
+        let load_ema = StakedStreamLoadEMA::new(
+            Arc::new(StreamerStats::default()),
+            DEFAULT_MAX_UNSTAKED_CONNECTIONS,
+            8000,
+        );
+        load_ema
+            .staked_throttling_enabled
+            .store(true, Ordering::Relaxed);
+
+        // 1M SOL of ~400M SOL total: 640_000 * 1e15 overflows u64, so the old code saturated
+        // and handed this peer the unstaked floor instead of its 0.25% share (1_600).
+        const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
+        let stake = 1_000_000 * LAMPORTS_PER_SOL;
+        let total_stake = 400_000_000 * LAMPORTS_PER_SOL;
+        assert_eq!(
+            load_ema.available_load_capacity_in_throttling_duration(
+                ConnectionPeerType::Staked(stake),
+                total_stake
+            ),
+            1_600
         );
     }
 
