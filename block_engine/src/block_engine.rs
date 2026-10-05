@@ -818,6 +818,17 @@ impl BlockEngineRelayerHandler {
                     }
                 }
 
+                // The Flowra engine subscribes with the "*" wildcard. With nothing to screen for
+                // (no OFAC list) the decode below would only be thrown away: every packet here
+                // already passed sigverify, which parsed it. Skip it — it is a full owned decode
+                // (allocations included) per TPU packet on this leg's only thread.
+                if forward_all && ofac_addresses.is_empty() {
+                    if let Some(packet) = packet_to_proto_packet(packet) {
+                        filtered_packets.push(packet);
+                    }
+                    continue;
+                }
+
                 if let Some(tx) = packet
                     .data(..)
                     .and_then(jito_core::tx_decode::deserialize_transaction)

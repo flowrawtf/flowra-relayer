@@ -554,7 +554,10 @@ pub struct RelayerImpl {
 /// drop has to be attributable to the validator it is being made for. The validator is the party
 /// accountable for its own block; nothing here comes from a relayer-local config file.
 pub struct StoredPolicy {
-    pub filter: PbpFilter,
+    /// Shared, not owned: `forward_packets` takes a copy of every live recipient's policy for
+    /// each batch, and cloning the sets themselves there cost a full copy of every blacklist
+    /// per batch per validator.
+    pub filter: Arc<PbpFilter>,
     /// Refreshed on every push. A policy that stops being refreshed expires, because the relayer
     /// has no standing to keep dropping on an authority that has gone quiet.
     pub updated_at: Instant,
@@ -889,7 +892,7 @@ impl RelayerImpl {
             }
         };
         let now = Instant::now();
-        let live_policies: Vec<(Pubkey, PbpFilter)> = recipients
+        let live_policies: Vec<(Pubkey, Arc<PbpFilter>)> = recipients
             .iter()
             .filter_map(|pubkey| {
                 let entry = validator_policies.get(pubkey)?;
@@ -985,7 +988,19 @@ impl RelayerImpl {
                 })
                 .collect()
         };
-        let shared_batches = chunk(&packets);
+        // With no live policy (the common case) nothing else reads `packets`, so move them into
+        // the shared batches instead of copying every packet's bytes a second time.
+        let shared_batches = if per_validator.is_empty() {
+            let mut packets = packets.into_iter();
+            std::iter::from_fn(|| {
+                let packets: Vec<ProtoPacket> =
+                    packets.by_ref().take(validator_packet_batch_size.max(1)).collect();
+                (!packets.is_empty()).then_some(ProtoPacketBatch { packets })
+            })
+            .collect()
+        } else {
+            chunk(&packets)
+        };
         let filtered_batches: HashMap<Pubkey, Vec<ProtoPacketBatch>> = per_validator
             .iter()
             .map(|(pubkey, kept)| (*pubkey, chunk(kept)))
@@ -1243,7 +1258,7 @@ impl Relayer for RelayerImpl {
         self.validator_policies.insert(
             pubkey,
             StoredPolicy {
-                filter,
+                filter: Arc::new(filter),
                 updated_at: Instant::now(),
                 digest: digest.clone(),
             },
