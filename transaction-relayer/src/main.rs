@@ -201,6 +201,23 @@ struct Args {
     #[arg(long, env, default_value_t = 10)]
     missing_slot_unhealthy_secs: u64,
 
+    /// How long the slot stream may stall before the process exits so systemd restarts it with
+    /// fresh websocket subscriptions. Must exceed --missing-slot-unhealthy-secs; 0 disables.
+    #[arg(long, env, default_value_t = 180)]
+    slot_stall_restart_secs: u64,
+
+    /// SO_KEEPALIVE idle time on accepted gRPC connections. 0 disables.
+    #[arg(long, env, default_value_t = 15)]
+    grpc_tcp_keepalive_secs: u64,
+
+    /// How often to send an HTTP/2 PING on an idle gRPC connection. 0 disables.
+    #[arg(long, env, default_value_t = 10)]
+    grpc_http2_keepalive_interval_secs: u64,
+
+    /// How long to wait for an HTTP/2 PING ack before closing the connection. 0 disables.
+    #[arg(long, env, default_value_t = 5)]
+    grpc_http2_keepalive_timeout_secs: u64,
+
     /// DEPRECATED. Solana cluster name (mainnet-beta, testnet, devnet, ...)
     #[arg(long, env)]
     cluster: Option<String>,
@@ -287,6 +304,11 @@ struct Args {
 #[derive(Debug)]
 struct Sockets {
     tpu_sockets: TpuSockets,
+}
+
+/// Treat 0 as "disabled" for the duration-valued knobs above.
+fn opt_secs(secs: u64) -> Option<Duration> {
+    (secs > 0).then(|| Duration::from_secs(secs))
 }
 
 fn get_sockets(args: &Args) -> Sockets {
@@ -592,10 +614,25 @@ fn main() {
     // downstream channel gets data that was duplicated by HealthManager
     let (downstream_slot_sender, downstream_slot_receiver) =
         crossbeam_channel::bounded(LoadBalancer::SLOT_QUEUE_CAPACITY);
+    let slot_stall_restart_threshold = match args.slot_stall_restart_secs {
+        0 => {
+            warn!("--slot-stall-restart-secs is 0; a wedged slot stream will not self-recover");
+            None
+        }
+        secs => {
+            assert!(
+                secs > args.missing_slot_unhealthy_secs,
+                "--slot-stall-restart-secs ({secs}) must exceed --missing-slot-unhealthy-secs ({})",
+                args.missing_slot_unhealthy_secs
+            );
+            Some(Duration::from_secs(secs))
+        }
+    };
     let health_manager = HealthManager::new(
         slot_receiver,
         downstream_slot_sender,
         Duration::from_secs(args.missing_slot_unhealthy_secs),
+        slot_stall_restart_threshold,
         exit.clone(),
     );
 
@@ -701,7 +738,14 @@ fn main() {
         );
 
         info!("starting relayer at: {:?}", server_addr);
+        // A link flap leaves inbound streams half-open: the peer is gone but we never see a RST,
+        // so without keepalive the connection sits in ESTAB and we keep a dead subscriber.
+        // HTTP/2 PINGs catch that end to end (nginx terminates TLS in front of us), TCP keepalive
+        // catches a dead nginx itself.
         Server::builder()
+            .tcp_keepalive(opt_secs(args.grpc_tcp_keepalive_secs))
+            .http2_keepalive_interval(opt_secs(args.grpc_http2_keepalive_interval_secs))
+            .http2_keepalive_timeout(opt_secs(args.grpc_http2_keepalive_timeout_secs))
             .add_service(RelayerServer::with_interceptor(
                 relayer_svc,
                 AuthInterceptor::new(verifying_key.clone(), AlgorithmType::Rs256),

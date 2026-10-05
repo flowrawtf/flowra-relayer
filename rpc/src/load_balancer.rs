@@ -96,7 +96,7 @@ impl LoadBalancer {
                             let mut last_slot_update = Instant::now();
 
                             match PubsubClient::slot_subscribe(&websocket_url) {
-                                Ok((_subscription, receiver)) => {
+                                Ok((subscription, receiver)) => {
                                     while !exit.load(Ordering::Relaxed) {
                                         match receiver.recv_timeout(Duration::from_millis(100))
                                         {
@@ -140,6 +140,22 @@ impl LoadBalancer {
                                                 break;
                                             }
                                         }
+                                    }
+
+                                    // Dropping the subscription here can block forever: the pubsub
+                                    // receive thread holds the socket's RwLock across a blocking
+                                    // read(), and on a half-open connection (link down, no RST)
+                                    // that read never returns, so Drop's unsubscribe can never
+                                    // take the lock. Hand the teardown to a throwaway thread so
+                                    // this one always gets back to slot_subscribe().
+                                    if thread::Builder::new()
+                                        .name(format!("lb_sub_drop-{ws_url_no_token}"))
+                                        .spawn(move || drop(subscription))
+                                        .is_err()
+                                    {
+                                        error!(
+                                            "could not spawn teardown thread for {ws_url_no_token}; dropping inline"
+                                        );
                                     }
                                 }
                                 Err(e) => {

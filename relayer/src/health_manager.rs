@@ -9,7 +9,8 @@ use std::{
 };
 
 use crossbeam_channel::{select, tick, Receiver, Sender};
-use solana_metrics::datapoint_info;
+use log::error;
+use solana_metrics::{datapoint_error, datapoint_info};
 use solana_clock::Slot;
 
 #[derive(PartialEq, Eq, Copy, Clone)]
@@ -26,10 +27,15 @@ pub struct HealthManager {
 /// Manages health status of the relayer. Reports to metrics and other parts of system health
 /// status so they can react accordingly.
 impl HealthManager {
+    /// Exit code used when the slot stream stalls past `slot_stall_restart_threshold`.
+    /// systemd (Restart=always) brings us back with fresh subscriptions.
+    pub const SLOT_STALL_EXIT_CODE: i32 = 17;
+
     pub fn new(
         slot_receiver: Receiver<Slot>,
         slot_sender: Sender<Slot>,
         missing_slot_unhealthy_threshold: Duration,
+        slot_stall_restart_threshold: Option<Duration>,
         exit: Arc<AtomicBool>,
     ) -> HealthManager {
         let health_state = Arc::new(RwLock::new(HealthState::Unhealthy));
@@ -56,6 +62,27 @@ impl HealthManager {
                                     "relayer-health-state",
                                     ("health_state", new_health_state, i64)
                                 );
+
+                                // Being unhealthy is recoverable; a slot stream that never comes
+                                // back is not. The websocket supervisor can wedge in ways it
+                                // cannot see (e.g. a blocking teardown on a half-open socket),
+                                // so if we have gone this long without a single slot from any
+                                // endpoint, exit and let systemd rebuild every connection.
+                                if let Some(threshold) = slot_stall_restart_threshold {
+                                    let stalled_for = last_update.elapsed();
+                                    if stalled_for >= threshold {
+                                        datapoint_error!(
+                                            "relayer-slot_stall_restart",
+                                            ("stalled_secs", stalled_for.as_secs(), i64)
+                                        );
+                                        error!(
+                                            "no slot received in {stalled_for:?} (threshold {threshold:?}); \
+                                             exiting so the slot subscriptions are rebuilt"
+                                        );
+                                        solana_metrics::flush();
+                                        std::process::exit(Self::SLOT_STALL_EXIT_CODE);
+                                    }
+                                }
                             }
                             recv(slot_receiver) -> maybe_slot => {
                                 let slot = maybe_slot.expect("error receiving slot, exiting");
