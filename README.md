@@ -6,7 +6,6 @@
 
 | Change | Detail |
 |--------|--------|
-| `--packet-delay-ms` default | Changed `50ms → 0ms` (Flowra target: zero delay) |
 | Proto extensions | `block_engine.proto` extended with `ProgramsOfInterestRequest/Update` and `SubscribeProgramsOfInterest` RPC |
 | `AccountsOfInterestUpdate` | Changed from `oneof msg` to flat `repeated string accounts` field to match jito-relayer's actual usage |
 
@@ -45,7 +44,7 @@ cargo build --release --bin jito-transaction-relayer
   --rpc-servers                http://127.0.0.1:8899 \
   --block-engine-url           http://127.0.0.1:11228 \
   --block-engine-auth-service-url http://127.0.0.1:8003 \
-  --packet-delay-ms            0 \
+  --packet-delay-ms            50 \
   --grpc-bind-ip               0.0.0.0 \
   --grpc-bind-port             11230
 ```
@@ -56,7 +55,7 @@ cargo build --release --bin jito-transaction-relayer
 |------|---------|-------------|
 | `--block-engine-url` | — | flowra-engine relayer port (11228) |
 | `--block-engine-auth-service-url` | same as above | flowra-engine auth port (8003) |
-| `--packet-delay-ms` | `0` | Packet forwarding delay (upstream default was 50ms) |
+| `--packet-delay-ms` | `50` | How long packets are held before going to the validator, so bundles reach it first (same as upstream; mainnet runs 50) |
 | `--keypair-path` | — | Relayer identity keypair (used for auth challenge signing) |
 | `--flowra-debug-telemetry` | off | Export metrics to `SOLANA_METRICS_CONFIG`. See below. |
 

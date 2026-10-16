@@ -10,3 +10,7 @@
 
 .env
 docker-output/
+# Keys and local logs never belong in the repo
+config/solana/*.json
+config/keys/*.pem
+*.log
